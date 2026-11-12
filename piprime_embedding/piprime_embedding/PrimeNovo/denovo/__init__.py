@@ -1,0 +1,1 @@
+"""De novo sequencing module"""
