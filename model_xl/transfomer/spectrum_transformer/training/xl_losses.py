@@ -14,6 +14,8 @@ from .target_processing import build_main_peak_mask
 MAIN_PEAK_THRESHOLD = 0.03
 SHORT_CHAIN_MAX_LENGTH = 16
 EMPTY_PEAK_TOKEN_IDS = MAIN_TOKEN_IDS + SATELLITE_TOKEN_IDS
+PEAK_RANKING_TOP_K = 8
+PEAK_RANKING_MARGIN = 0.02
 XL_LOSS_WEIGHTS = {
     "v20_backbone_global_loss": 0.20,
     "v20_main_peak_amp_loss": 0.80,
@@ -33,6 +35,25 @@ def _weighted_anchor_bce(cell_bce, anchor_labels, subthreshold, cell_weight, *, 
     return (cell_bce * peak_weight * cell_weight).sum() / cell_weight.sum().clamp_min(1.0)
 
 
+def _peak_ranking_loss(prediction, target, valid_mask):
+    group_losses, eligible_groups = [], []
+    for token_ids in (MAIN_TOKEN_IDS, SATELLITE_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS):
+        scores, labels, valid = (grid[..., token_ids, :].flatten(1) for grid in (prediction, target, valid_mask))
+        positives = valid & (labels > MAIN_PEAK_THRESHOLD)
+        empty = valid & (labels == 0)
+        # Mine hard negatives independently within each peptide pair and family.
+        k = min(PEAK_RANKING_TOP_K, scores.shape[1])
+        hard_scores = scores.masked_fill(~empty, -torch.inf).topk(k, dim=1).values
+        has_negative = hard_scores.isfinite()
+        hard_scores = hard_scores.masked_fill(~has_negative, 0.0)
+        comparisons = positives[:, :, None] & has_negative[:, None, :]
+        violations = F.relu(PEAK_RANKING_MARGIN + hard_scores[:, None, :] - scores[:, :, None])
+        count = comparisons.sum(dim=(1, 2))
+        group_losses.append(violations.masked_fill(~comparisons, 0.0).sum(dim=(1, 2)) / count.clamp_min(1))
+        eligible_groups.append(count > 0)
+    return torch.stack(group_losses).sum() / torch.stack(eligible_groups).sum().clamp_min(1)
+
+
 def xl_compound_loss(
     prediction,
     target,
@@ -44,6 +65,7 @@ def xl_compound_loss(
     main_anchor_target=None,
     main_anchor_mask=None,
     empty_peak_weight=0.0,
+    peak_ranking_weight=0.0,
 ):
     """Return the scalar loss and its components for grids shaped ``(B, 2, H, T, C)``."""
     if prediction.ndim != 5 or prediction.shape[1] != 2:
@@ -113,5 +135,9 @@ def xl_compound_loss(
         empty_peak_mae = masked_l1(prediction[..., EMPTY_PEAK_TOKEN_IDS, :], empty_peak_target, empty_peak_mask)
         metrics["empty_peak_mae"] = empty_peak_mae
         loss = loss + empty_peak_weight * empty_peak_mae
+    if peak_ranking_weight:
+        peak_ranking = _peak_ranking_loss(prediction, target, valid_mask)
+        metrics["peak_ranking_loss"] = peak_ranking
+        loss = loss + peak_ranking_weight * peak_ranking
     metrics["loss"] = loss
     return loss, dict(zip(metrics, torch.stack(tuple(metrics.values())).detach().tolist()))

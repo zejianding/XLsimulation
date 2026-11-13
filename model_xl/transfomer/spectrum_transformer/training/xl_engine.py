@@ -37,13 +37,14 @@ def predict_xl_batch(model, batch):
     )
 
 
-def compute_xl_batch_loss(output, batch, *, empty_peak_weight=0.0):
+def compute_xl_batch_loss(output, batch, *, empty_peak_weight=0.0, peak_ranking_weight=0.0):
     return xl_compound_loss(
         output["prediction"], batch["target"], batch["valid_mask"],
         charges=batch["precursor_charge"], lengths=batch["lengths"],
         main_anchor_prob=output["main_anchor_prob"],
         main_anchor_target=batch["main_anchor_target"], main_anchor_mask=batch["main_anchor_mask"],
         empty_peak_weight=empty_peak_weight,
+        peak_ranking_weight=peak_ranking_weight,
     )
 
 
