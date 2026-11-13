@@ -13,6 +13,7 @@ from .target_processing import build_main_peak_mask
 
 MAIN_PEAK_THRESHOLD = 0.03
 SHORT_CHAIN_MAX_LENGTH = 16
+EMPTY_PEAK_TOKEN_IDS = MAIN_TOKEN_IDS + SATELLITE_TOKEN_IDS
 XL_LOSS_WEIGHTS = {
     "v20_backbone_global_loss": 0.20,
     "v20_main_peak_amp_loss": 0.80,
@@ -42,6 +43,7 @@ def xl_compound_loss(
     main_anchor_prob,
     main_anchor_target=None,
     main_anchor_mask=None,
+    empty_peak_weight=0.0,
 ):
     """Return the scalar loss and its components for grids shaped ``(B, 2, H, T, C)``."""
     if prediction.ndim != 5 or prediction.shape[1] != 2:
@@ -105,5 +107,11 @@ def xl_compound_loss(
         "v20_density_gap_penalty": density_gap,
     }
     loss = sum(weight * metrics[name] for name, weight in XL_LOSS_WEIGHTS.items())
+    if empty_peak_weight:
+        empty_peak_target = target[..., EMPTY_PEAK_TOKEN_IDS, :]
+        empty_peak_mask = valid_mask[..., EMPTY_PEAK_TOKEN_IDS, :] & (empty_peak_target == 0)
+        empty_peak_mae = masked_l1(prediction[..., EMPTY_PEAK_TOKEN_IDS, :], empty_peak_target, empty_peak_mask)
+        metrics["empty_peak_mae"] = empty_peak_mae
+        loss = loss + empty_peak_weight * empty_peak_mae
     metrics["loss"] = loss
     return loss, dict(zip(metrics, torch.stack(tuple(metrics.values())).detach().tolist()))

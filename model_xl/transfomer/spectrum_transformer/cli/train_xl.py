@@ -8,6 +8,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 from itertools import islice
+from math import isfinite
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import perf_counter
@@ -82,7 +83,7 @@ def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
                            "residue_event": RESIDUE_EVENT_TOKEN_IDS},
         "loss": {"weights": XL_LOSS_WEIGHTS, "shared_main_peak_weight": 1.0,
                  "main_peak_threshold": MAIN_PEAK_THRESHOLD, "short_chain_max_length": SHORT_CHAIN_MAX_LENGTH,
-                 "short_chain_scope": "per_chain"},
+                 "short_chain_scope": "per_chain", "empty_peak_weight": args.empty_peak_weight},
         "anchor_probability_threshold": ANCHOR_PROBABILITY_THRESHOLD,
         "training": {"seed": args.seed, "batch_size": args.batch_size, "num_workers": args.num_workers,
                      "epochs": args.epochs, "optimizer": "AdamW", "lr": args.lr, "weight_decay": args.weight_decay},
@@ -99,10 +100,10 @@ def _save_checkpoint(checkpoint, destination):
         staging.unlink(missing_ok=True)
 
 
-def _backward(model, optimizer, batch):
+def _backward(model, optimizer, batch, *, empty_peak_weight):
     optimizer.zero_grad(set_to_none=True)
     output = predict_xl_batch(model, batch)
-    loss, terms = compute_xl_batch_loss(output, batch)
+    loss, terms = compute_xl_batch_loss(output, batch, empty_peak_weight=empty_peak_weight)
     if not torch.isfinite(loss):
         raise RuntimeError("Non-finite XL training loss")
     loss.backward()
@@ -124,7 +125,7 @@ def _smoke(model, optimizer, dataset, args, device):
     batch = prepare_xl_batch(raw_batch, device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    output, loss, terms = _backward(model, optimizer, batch)
+    output, loss, terms = _backward(model, optimizer, batch, empty_peak_weight=args.empty_peak_weight)
     expected_shape = batch["target"].shape
     for key in ("prediction", "backbone_pred", "detail_pred", "detail_logits", "main_anchor_logits", "main_anchor_prob"):
         if output[key].shape != expected_shape or not torch.isfinite(output[key]).all():
@@ -327,7 +328,8 @@ def _train_steps(model, optimizer, train_data, args, device):
         log("config", lr=args.lr, max_steps=args.max_steps, seed=args.seed, batch_size=args.batch_size,
             num_workers=args.num_workers, weight_decay=args.weight_decay, optimizer="AdamW",
             device=str(device), dataset_dir=str(args.dataset_dir.resolve()), model_config=MODEL_CONFIG,
-            loss_weights=XL_LOSS_WEIGHTS, template_train_indices=fit_indices, validation_indices=val_indices,
+            loss_weights=XL_LOSS_WEIGHTS, empty_peak_weight=args.empty_peak_weight,
+            template_train_indices=fit_indices, validation_indices=val_indices,
             activation_probe_group_ids=raw_probe["group_id"])
         log("probe", step=0, **_step_probe(model, probe_batch, fit_loader, val_loader, device))
         step = 0
@@ -336,7 +338,7 @@ def _train_steps(model, optimizer, train_data, args, device):
                 model.train()
                 for raw in islice(train_loader, args.max_steps - step):
                     batch = prepare_xl_batch(raw, device)
-                    output, _, terms = _backward(model, optimizer, batch)
+                    output, _, terms = _backward(model, optimizer, batch, empty_peak_weight=args.empty_peak_weight)
                     del output
                     step += 1
                     gradients = _gradient_norms(model) if step in gradient_steps else None
@@ -360,6 +362,7 @@ def _train(model, optimizer, train_data, args, device):
     args.output_dir.mkdir(parents=True, exist_ok=False)
     logger = TrainingLogger(args.output_dir)
     best_path = args.output_dir / "best.pt"
+    final_epoch_path = best_path
     best = (-float("inf"), -float("inf"))
     batch_count = len(train_loader)
     total_epoch_seconds = 0.0
@@ -375,7 +378,7 @@ def _train(model, optimizer, train_data, args, device):
                   file=sys.stderr, disable=None) as progress:
             for batch_index, batch in enumerate(progress, start=1):
                 batch = prepare_xl_batch(batch, device)
-                output, _, terms = _backward(model, optimizer, batch)
+                output, _, terms = _backward(model, optimizer, batch, empty_peak_weight=args.empty_peak_weight)
                 optimizer.step()
                 for name, value in terms.items():
                     epoch_terms[name] += value * batch["target"].shape[0]
@@ -407,6 +410,10 @@ def _train(model, optimizer, train_data, args, device):
         if is_best:
             _save_checkpoint(_checkpoint(model, optimizer, train_data, args, epoch, validation), best_path)
             best = score
+        elif args.empty_peak_weight and epoch == args.epochs:
+            # Keep the last ablation epoch available for a comparison at equal training budgets.
+            final_epoch_path = args.output_dir / "last.pt"
+            _save_checkpoint(_checkpoint(model, optimizer, train_data, args, epoch, validation), final_epoch_path)
         epoch_end = perf_counter()
         epoch_seconds = epoch_end - epoch_start
         total_epoch_seconds += epoch_seconds
@@ -436,6 +443,9 @@ def _train(model, optimizer, train_data, args, device):
         "training_log_path": str(logger.log_path.resolve()),
         "training_history_path": str(logger.history_path.resolve()),
     }
+    if args.empty_peak_weight:
+        summary["empty_peak_weight"] = args.empty_peak_weight
+        summary["final_epoch_checkpoint"] = str(final_epoch_path.resolve())
     (args.output_dir / "run_summary.json").write_text(
         json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8",
     )
@@ -462,11 +472,15 @@ def main():
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
+    parser.add_argument("--empty-peak-weight", type=float, default=0.0,
+                        help="MAE weight for valid zero-target main and satellite cells (default: 0)")
     args = parser.parse_args()
     if args.batch_size < 1 or args.epochs < 1 or args.num_workers < 0:
         parser.error("--batch-size and --epochs must be positive and --num-workers must be nonnegative")
     if args.max_steps is not None and (args.max_steps < 1 or args.smoke):
         parser.error("--max-steps must be positive and cannot be combined with --smoke")
+    if not isfinite(args.empty_peak_weight) or args.empty_peak_weight < 0:
+        parser.error("--empty-peak-weight must be finite and nonnegative")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
