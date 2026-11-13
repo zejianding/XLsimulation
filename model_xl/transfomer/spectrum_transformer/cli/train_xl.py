@@ -7,6 +7,7 @@ import random
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
+from itertools import islice
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import perf_counter
@@ -23,6 +24,7 @@ from spectrum_transformer.config import (
 )
 from spectrum_transformer.data.xl_dataset import CLEAVAGE_SCALAR_FEATURE_NAMES, XLSpectrumDataset
 from spectrum_transformer.models.xl_transformer import XLSpectrumTransformer
+from spectrum_transformer.training.engine import _cosine_per_sample, _masked_mae_per_sample
 from spectrum_transformer.training.logger import TrainingLogger
 from spectrum_transformer.training.xl_engine import (
     ANCHOR_PROBABILITY_THRESHOLD, compute_xl_batch_loss, evaluate_xl, predict_xl_batch, prepare_xl_batch,
@@ -163,6 +165,191 @@ def _smoke(model, optimizer, dataset, args, device):
     print(json.dumps(report, indent=2, allow_nan=False), flush=True)
 
 
+def _probe_indices(dataset, seed, per_charge):
+    rng = np.random.default_rng(seed)
+    charges = dataset.precursor_charges
+    return [index for charge in np.unique(charges)
+            for index in rng.permutation(np.flatnonzero(charges == charge))[:per_charge].tolist()]
+
+
+def _token_variation(hidden, valid):
+    """Mean per-pair RMS of the channel-wise standard deviations over valid tokens."""
+    valid = valid.unsqueeze(-1)
+    count = valid.sum(dim=1).clamp_min(1)
+    mean = (hidden * valid).sum(dim=1) / count
+    variance = ((hidden - mean[:, None, :]).square() * valid).sum(dim=1) / count
+    return variance.mean(dim=-1).sqrt().mean().item()
+
+
+def _activation_probe(model, batch):
+    counts = batch["valid_mask"].any(dim=-1).flatten(1).sum(1)
+    counts = counts[counts > 0]
+    variation = {}
+
+    def record(name, hidden):
+        packed_valid = torch.arange(hidden.shape[1], device=hidden.device)[None, :] < counts[:, None]
+        variation[name] = _token_variation(hidden, packed_valid)
+
+    def record_layer(layer_number):
+        def hook(_module, inputs, output):
+            if layer_number == 1:
+                record("encoder_input", inputs[0])
+            record(f"shared_layer_{layer_number}", output)
+        return hook
+
+    layers = model.shared_encoder.encoder.layers
+    handles = [layers[number - 1].register_forward_hook(record_layer(number)) for number in (1, 3, 5)]
+    fastpath = torch.backends.mha.get_fastpath_enabled()
+    try:
+        # Keep the packed tensor dense so eval-mode layer hooks see the padding layout.
+        torch.backends.mha.set_fastpath_enabled(False)
+        prediction = predict_xl_batch(model, batch)["prediction"]
+        altered = dict(batch)
+        for key in ("input", "aux_features", "cleavage_aa_ids", "cleavage_scalar_features"):
+            altered[key] = torch.zeros_like(batch[key])
+        for handle in handles:
+            handle.remove()
+        handles.clear()
+        perturbed = predict_xl_batch(model, altered)["prediction"]
+    finally:
+        for handle in handles:
+            handle.remove()
+        torch.backends.mha.set_fastpath_enabled(fastpath)
+    valid = batch["valid_mask"]
+    delta = (prediction - perturbed).abs()[valid]
+    return {"token_variation_rms": variation,
+            "input_ablation_prediction_mae": delta.mean().item() if delta.numel() else None}
+
+
+def _fit_prediction_template(model, loader, device):
+    family = model.token_family_index
+    sums, counts = {}, {}
+    for raw in loader:
+        batch = prepare_xl_batch(raw, device)
+        prediction = predict_xl_batch(model, batch)["prediction"]
+        for charge in raw["precursor_charge"].unique().tolist():
+            selected = batch["precursor_charge"] == charge
+            valid = batch["valid_mask"][selected]
+            total = (prediction[selected] * valid).sum(dim=(0, 1, 2), dtype=torch.float64)
+            count = valid.sum(dim=(0, 1, 2))
+            sums[charge] = sums.get(charge, 0) + total
+            counts[charge] = counts.get(charge, 0) + count
+    templates = {}
+    for charge, total in sums.items():
+        template = torch.zeros_like(total, dtype=torch.float32)
+        for family_id in range(3):
+            mask = family == family_id
+            template[mask] = (total[mask].sum(0) / counts[charge][mask].sum(0).clamp_min(1)).float()
+        templates[charge] = template
+    return templates
+
+
+def _evaluate_step(model, loader, templates, device):
+    rows, template_rows = defaultdict(list), defaultdict(list)
+    for raw in loader:
+        batch = prepare_xl_batch(raw, device)
+        prediction = predict_xl_batch(model, batch)["prediction"]
+        target, valid = batch["target"], batch["valid_mask"]
+        cosine = _cosine_per_sample(prediction, target, valid)
+        positive_mae = _masked_mae_per_sample(prediction, target, (target > 0) & valid)
+        pred_density, target_density = xl_density_per_sample(prediction, target, valid)
+        for charge in raw["precursor_charge"].unique().tolist():
+            selected = batch["precursor_charge"] == charge
+            rows[charge].append(torch.stack((cosine, positive_mae, pred_density, target_density), dim=1)[selected])
+            if charge in templates:
+                reference = templates[charge].expand_as(target[selected])
+                reference_cosine = _cosine_per_sample(reference, target[selected], valid[selected])
+                template_rows[charge].append(torch.stack((reference_cosine, cosine[selected] - reference_cosine), dim=1))
+
+    def summarize(metrics, comparison):
+        values = torch.cat(metrics)
+        names = ("cosine", "positive_mae", "pred_nonzero_ratio", "target_nonzero_ratio")
+        report = dict(zip(names, values.mean(dim=0).tolist()))
+        report["samples"] = len(values)
+        if comparison:
+            paired = torch.cat(comparison)
+            report["template_cosine"], report["cosine_gain_over_template"] = paired.mean(dim=0).tolist()
+            report["template_comparison_samples"] = len(paired)
+        return report
+
+    report = summarize([row for group in rows.values() for row in group],
+                       [row for group in template_rows.values() for row in group])
+    report["by_charge"] = {charge: summarize(group, template_rows[charge]) for charge, group in rows.items()}
+    return report
+
+
+def _step_probe(model, probe_batch, fit_loader, val_loader, device):
+    was_training = model.training
+    try:
+        model.eval()
+        devices = [device] if device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices), torch.inference_mode():
+            activations = _activation_probe(model, probe_batch)
+            templates = _fit_prediction_template(model, fit_loader, device)
+            validation = _evaluate_step(model, val_loader, templates, device)
+        return {**activations, "validation": validation}
+    finally:
+        model.train(was_training)
+
+
+def _gradient_norms(model):
+    layers = model.shared_encoder.encoder.layers
+    modules = {"input_proj": model.input_proj, "shared_layer_1": layers[0], "shared_layer_3": layers[2],
+               "shared_layer_5": layers[4], "backbone_head": model.backbone_head}
+    norms = {}
+    for name, module in modules.items():
+        values = [parameter.grad.detach().float().square().sum()
+                  for parameter in module.parameters() if parameter.grad is not None]
+        norms[name] = torch.stack(values).sum().sqrt().item() if values else None
+    return norms
+
+
+def _train_steps(model, optimizer, train_data, args, device):
+    val_data = XLSpectrumDataset(args.dataset_dir, "val")
+    if not len(val_data):
+        raise ValueError("XL step diagnostics require a nonempty validation split")
+    fit_indices = _probe_indices(train_data, args.seed, per_charge=16)
+    val_indices = _probe_indices(val_data, args.seed, per_charge=32)
+    probe_indices = _smoke_indices(val_data, args.batch_size, args.seed)
+    train_loader = _loader(train_data, args, device, shuffle=True)
+    fit_loader = _loader(train_data, args, device, indices=fit_indices)
+    val_loader = _loader(val_data, args, device, indices=val_indices)
+    raw_probe = val_data.collate_fn([val_data[index] for index in probe_indices])
+    probe_batch = prepare_xl_batch(raw_probe, device)
+    probe_steps = {0, 50, 100, 200, 500, args.max_steps}
+    gradient_steps = probe_steps | {1}
+    args.output_dir.mkdir(parents=True, exist_ok=False)
+    log_path = args.output_dir / "step_metrics.jsonl"
+    with log_path.open("x", encoding="utf-8", buffering=1) as stream:
+        def log(event, **fields):
+            stream.write(json.dumps({"event": event, **fields}, allow_nan=False) + "\n")
+
+        log("config", lr=args.lr, max_steps=args.max_steps, seed=args.seed, batch_size=args.batch_size,
+            num_workers=args.num_workers, weight_decay=args.weight_decay, optimizer="AdamW",
+            device=str(device), dataset_dir=str(args.dataset_dir.resolve()), model_config=MODEL_CONFIG,
+            loss_weights=XL_LOSS_WEIGHTS, template_train_indices=fit_indices, validation_indices=val_indices,
+            activation_probe_group_ids=raw_probe["group_id"])
+        log("probe", step=0, **_step_probe(model, probe_batch, fit_loader, val_loader, device))
+        step = 0
+        with tqdm(total=args.max_steps, desc="XL optimizer steps", unit="step", file=sys.stderr) as progress:
+            while step < args.max_steps:
+                model.train()
+                for raw in islice(train_loader, args.max_steps - step):
+                    batch = prepare_xl_batch(raw, device)
+                    output, _, terms = _backward(model, optimizer, batch)
+                    del output
+                    step += 1
+                    gradients = _gradient_norms(model) if step in gradient_steps else None
+                    optimizer.step()
+                    log("train", step=step, group_ids=raw["group_id"], loss_terms=terms,
+                        cosine=1.0 - terms["v20_backbone_cosine_loss"], gradient_l2=gradients)
+                    if step in probe_steps:
+                        log("probe", step=step, **_step_probe(model, probe_batch, fit_loader, val_loader, device))
+                    progress.update(1)
+        log("complete", step=step)
+    print(f"Completed {step} optimizer steps. Diagnostics: {log_path}", flush=True)
+
+
 def _train(model, optimizer, train_data, args, device):
     val_data = XLSpectrumDataset(args.dataset_dir, "val")
     test_data = XLSpectrumDataset(args.dataset_dir, "test")
@@ -267,6 +454,7 @@ def main():
         help="new directory for logs and best.pt (default: runs/xl_YYYYMMDD_HHMMSS)",
     )
     parser.add_argument("--smoke", action="store_true", help="run one real train batch and reload an in-memory checkpoint")
+    parser.add_argument("--max-steps", type=int, help="run this many optimizer updates and write step diagnostics")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -277,6 +465,8 @@ def main():
     args = parser.parse_args()
     if args.batch_size < 1 or args.epochs < 1 or args.num_workers < 0:
         parser.error("--batch-size and --epochs must be positive and --num-workers must be nonnegative")
+    if args.max_steps is not None and (args.max_steps < 1 or args.smoke):
+        parser.error("--max-steps must be positive and cannot be combined with --smoke")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -289,6 +479,8 @@ def main():
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if args.smoke:
         _smoke(model, optimizer, dataset, args, device)
+    elif args.max_steps is not None:
+        _train_steps(model, optimizer, dataset, args, device)
     else:
         _train(model, optimizer, dataset, args, device)
 
