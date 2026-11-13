@@ -34,6 +34,7 @@ from spectrum_transformer.training.xl_engine import (
 from spectrum_transformer.training.xl_losses import (
     MAIN_PEAK_THRESHOLD, PEAK_RANKING_MARGIN, PEAK_RANKING_TOP_K, SHORT_CHAIN_MAX_LENGTH, XL_LOSS_WEIGHTS,
 )
+from spectrum_transformer.training.xl_peak_evaluation import evaluate_xl_peak_selection
 from spectrum_transformer.warnings import configure_v20_warning_filters
 from token_table import CHARGE_TOKENS, MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS, SATELLITE_TOKEN_IDS
 
@@ -73,6 +74,25 @@ def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
     if args.peak_ranking_weight:
         loss_config["peak_ranking"] = {"weight": args.peak_ranking_weight, "top_k": PEAK_RANKING_TOP_K,
                                        "margin": PEAK_RANKING_MARGIN, "target_threshold": MAIN_PEAK_THRESHOLD}
+    selection = {"primary": "cosine", "tie_breaker": "masked_mae"}
+    if getattr(args, "peak_presence", False):
+        loss_config["weights"] = {name: weight for name, weight in XL_LOSS_WEIGHTS.items()
+                                  if name != "v20_main_anchor_z23_loss"}
+        loss_config["weights"]["peak_presence_bce"] = args.presence_loss_weight
+        loss_config["peak_presence"] = {
+            "head": "main_anchor_head", "target": "valid & (target > 0.03)",
+            "reduction": "mean of nonempty peptide-pair/family groups; equal means of present classes",
+            "positive_class_weight": 1.0, "negative_class_weight": 1.0,
+            "family_weights": {"main": 1.0, "satellite": 1.0, "residue_event": 1.0},
+            "selection_score": "sigmoid(main_anchor_logits)", "amplitude": "prediction",
+        }
+        selection = {
+            "primary": "peak_selection.presence.precision", "feasibility_first": True,
+            "prefer_recall_band": True,
+            "tie_breakers": ["cosine", "masked_mae"], "recall_floor": args.selection_recall_floor,
+            "recall_ceiling": args.selection_recall_ceiling,
+            "z3_weak_recall_floor": args.selection_weak_recall_floor,
+        }
     return {
         "model_type": "xl_spectrum_transformer",
         "model_config": MODEL_CONFIG,
@@ -80,7 +100,7 @@ def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
         "validation": metrics,
-        "selection": {"primary": "cosine", "tie_breaker": "masked_mae"},
+        "selection": selection,
         "data_schema_version": dataset.schema_version,
         "data_metadata": dataset.metadata,
         "channel_names": CHANNEL_NAMES,
@@ -111,11 +131,35 @@ def _backward(model, optimizer, batch, args):
     output = predict_xl_batch(model, batch)
     loss, terms = compute_xl_batch_loss(
         output, batch, empty_peak_weight=args.empty_peak_weight, peak_ranking_weight=args.peak_ranking_weight,
+        peak_presence=getattr(args, "peak_presence", False),
+        presence_loss_weight=getattr(args, "presence_loss_weight", 0.45),
     )
     if not torch.isfinite(loss):
         raise RuntimeError("Non-finite XL training loss")
     loss.backward()
     return output, loss, terms
+
+
+def _peak_selection_metrics(model, loader, device, args, fixed=None):
+    """Calibrate on validation or apply that checkpoint's saved thresholds to test."""
+    return {
+        source: evaluate_xl_peak_selection(
+            model, loader, device, score_source=source,
+            threshold=None if fixed is None else fixed[source]["threshold"],
+            recall_floor=args.selection_recall_floor, recall_ceiling=args.selection_recall_ceiling,
+            weak_recall_floor=args.selection_weak_recall_floor,
+            desc=f"Peak selection {source}",
+        )
+        for source in ("intensity", "presence")
+    }
+
+
+def _selection_score(metrics, peak_presence):
+    if peak_presence:
+        calibrated = metrics["peak_selection"]["presence"]
+        return (calibrated["feasible"], calibrated["recall_band_satisfied"], calibrated["precision"],
+                metrics["cosine"], -metrics["masked_mae"])
+    return (metrics["cosine"], -metrics["masked_mae"])
 
 
 def _history_fields(prefix, metrics):
@@ -154,7 +198,9 @@ def _smoke(model, optimizer, dataset, args, device):
     peak_gib = torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None
     del output
 
-    metrics = evaluate_xl(model, [raw_batch], device)
+    metrics = evaluate_xl(model, [raw_batch], device, peak_presence=getattr(args, "peak_presence", False))
+    if getattr(args, "peak_presence", False):
+        metrics["peak_selection"] = _peak_selection_metrics(model, [raw_batch], device, args)
     checkpoint = io.BytesIO()
     torch.save(_checkpoint(model, optimizer, dataset, args, 0, metrics), checkpoint)
     checkpoint.seek(0)
@@ -162,8 +208,10 @@ def _smoke(model, optimizer, dataset, args, device):
     reloaded_model = XLSpectrumTransformer(**restored["model_config"]).to(device).eval()
     reloaded_model.load_state_dict(restored["model_state_dict"])
     with torch.inference_mode():
-        torch.testing.assert_close(predict_xl_batch(model, batch)["prediction"],
-                                   predict_xl_batch(reloaded_model, batch)["prediction"])
+        original_output = predict_xl_batch(model, batch)
+        restored_output = predict_xl_batch(reloaded_model, batch)
+        for name in ("prediction", "main_anchor_logits", "main_anchor_prob"):
+            torch.testing.assert_close(original_output[name], restored_output[name])
     report = {
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else str(device),
         "shape": list(expected_shape), "charges": raw_batch["precursor_charge"].tolist(),
@@ -171,6 +219,8 @@ def _smoke(model, optimizer, dataset, args, device):
         "gradient_tensors": len(gradients), "peak_cuda_allocated_gib": peak_gib,
         "checkpoint_reload": "passed", "post_step_batch_cosine": metrics["cosine"],
     }
+    if getattr(args, "peak_presence", False):
+        report["peak_selection"] = metrics["peak_selection"]
     print(json.dumps(report, indent=2, allow_nan=False), flush=True)
 
 
@@ -338,6 +388,8 @@ def _train_steps(model, optimizer, train_data, args, device):
             device=str(device), dataset_dir=str(args.dataset_dir.resolve()), model_config=MODEL_CONFIG,
             loss_weights=XL_LOSS_WEIGHTS, empty_peak_weight=args.empty_peak_weight,
             peak_ranking_weight=args.peak_ranking_weight,
+            peak_presence=getattr(args, "peak_presence", False),
+            presence_loss_weight=getattr(args, "presence_loss_weight", 0.45),
             template_train_indices=fit_indices, validation_indices=val_indices,
             activation_probe_group_ids=raw_probe["group_id"])
         log("probe", step=0, **_step_probe(model, probe_batch, fit_loader, val_loader, device))
@@ -372,8 +424,9 @@ def _train(model, optimizer, train_data, args, device):
     logger = TrainingLogger(args.output_dir)
     best_path = args.output_dir / "best.pt"
     final_epoch_path = best_path
-    save_final_epoch = bool(args.empty_peak_weight or args.peak_ranking_weight)
-    best = (-float("inf"), -float("inf"))
+    peak_presence = getattr(args, "peak_presence", False)
+    save_final_epoch = bool(args.empty_peak_weight or args.peak_ranking_weight or peak_presence)
+    best = None
     batch_count = len(train_loader)
     total_epoch_seconds = 0.0
     total_validation_and_save_seconds = 0.0
@@ -411,12 +464,15 @@ def _train(model, optimizer, train_data, args, device):
                     )
                 del output
         validation_start = perf_counter()
-        validation = evaluate_xl(model, val_loader, device, desc=f"Val {epoch}/{args.epochs}")
+        validation = evaluate_xl(model, val_loader, device, desc=f"Val {epoch}/{args.epochs}",
+                                 peak_presence=peak_presence)
+        if peak_presence:
+            validation["peak_selection"] = _peak_selection_metrics(model, val_loader, device, args)
         train_losses = {name: total / len(train_data) for name, total in epoch_terms.items()}
         logger.log(json.dumps({"epoch": epoch, "train_loss_terms": train_losses,
                                "validation": validation}, allow_nan=False))
-        score = (validation["cosine"], -validation["masked_mae"])
-        is_best = score > best
+        score = _selection_score(validation, peak_presence)
+        is_best = best is None or score > best
         if is_best:
             _save_checkpoint(_checkpoint(model, optimizer, train_data, args, epoch, validation), best_path)
             best = score
@@ -442,7 +498,13 @@ def _train(model, optimizer, train_data, args, device):
     del train_loader, val_loader
     checkpoint = torch.load(best_path, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_metrics = evaluate_xl(model, _loader(test_data, args, device), device, desc="Test final")
+    test_metrics = evaluate_xl(model, _loader(test_data, args, device), device, desc="Test final",
+                               peak_presence=peak_presence)
+    if peak_presence:
+        test_metrics["peak_selection"] = _peak_selection_metrics(
+            model, _loader(test_data, args, device), device, args,
+            fixed=checkpoint["validation"]["peak_selection"],
+        )
     summary = {
         "model_type": checkpoint["model_type"],
         "best_epoch": checkpoint["epoch"],
@@ -458,11 +520,19 @@ def _train(model, optimizer, train_data, args, device):
         summary["final_epoch_checkpoint"] = str(final_epoch_path.resolve())
     if args.peak_ranking_weight:
         summary["peak_ranking_weight"] = args.peak_ranking_weight
+    if peak_presence:
+        summary["peak_presence"] = checkpoint["loss"]["peak_presence"]
+        summary["presence_loss_weight"] = args.presence_loss_weight
+        summary["validation_selection_feasible"] = checkpoint["validation"]["peak_selection"]["presence"]["feasible"]
     (args.output_dir / "run_summary.json").write_text(
         json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8",
     )
     final_message = (f"Best epoch {summary['best_epoch']} | val cosine {summary['best_val_metrics']['cosine']:.4f}"
                      f" | test cosine {test_metrics['cosine']:.4f} | test masked MAE {test_metrics['masked_mae']:.4f}")
+    if peak_presence:
+        peak_metrics = test_metrics["peak_selection"]["presence"]
+        final_message += (f" | peak precision {peak_metrics['precision']:.4f}"
+                          f" | recall {peak_metrics['recall']:.4f} | threshold {peak_metrics['threshold']:.4f}")
     logger.log(final_message, also_print=False)
     tqdm.write(final_message, file=sys.stderr)
 
@@ -488,6 +558,14 @@ def main():
                         help="MAE weight for valid zero-target main and satellite cells (default: 0)")
     parser.add_argument("--peak-ranking-weight", type=float, default=0.0,
                         help="weight for ranking true peaks above hard zero-target cells per ion family (default: 0)")
+    parser.add_argument("--peak-presence", action="store_true",
+                        help="train the auxiliary head on all valid peaks and select by calibrated peak precision")
+    parser.add_argument("--presence-loss-weight", type=float, default=0.45,
+                        help="full-grid balanced BCE coefficient with --peak-presence (default: 0.45)")
+    parser.add_argument("--selection-recall-floor", type=float, default=0.9195575)
+    parser.add_argument("--selection-recall-ceiling", type=float, default=0.9200575)
+    parser.add_argument("--selection-weak-recall-floor", type=float,
+                        help="optional Z3 weak-peak recall constraint on validation threshold calibration")
     args = parser.parse_args()
     if args.batch_size < 1 or args.epochs < 1 or args.num_workers < 0:
         parser.error("--batch-size and --epochs must be positive and --num-workers must be nonnegative")
@@ -497,6 +575,12 @@ def main():
         parser.error("--empty-peak-weight must be finite and nonnegative")
     if not isfinite(args.peak_ranking_weight) or args.peak_ranking_weight < 0:
         parser.error("--peak-ranking-weight must be finite and nonnegative")
+    if not isfinite(args.presence_loss_weight) or args.presence_loss_weight <= 0:
+        parser.error("--presence-loss-weight must be finite and positive")
+    if not 0 <= args.selection_recall_floor <= args.selection_recall_ceiling <= 1:
+        parser.error("selection recall bounds must satisfy 0 <= floor <= ceiling <= 1")
+    if args.selection_weak_recall_floor is not None and not 0 <= args.selection_weak_recall_floor <= 1:
+        parser.error("--selection-weak-recall-floor must be between 0 and 1")
 
     random.seed(args.seed)
     np.random.seed(args.seed)

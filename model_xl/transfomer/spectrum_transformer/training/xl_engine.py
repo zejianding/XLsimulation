@@ -37,7 +37,8 @@ def predict_xl_batch(model, batch):
     )
 
 
-def compute_xl_batch_loss(output, batch, *, empty_peak_weight=0.0, peak_ranking_weight=0.0):
+def compute_xl_batch_loss(output, batch, *, empty_peak_weight=0.0, peak_ranking_weight=0.0,
+                          peak_presence=False, presence_loss_weight=0.45):
     return xl_compound_loss(
         output["prediction"], batch["target"], batch["valid_mask"],
         charges=batch["precursor_charge"], lengths=batch["lengths"],
@@ -45,6 +46,9 @@ def compute_xl_batch_loss(output, batch, *, empty_peak_weight=0.0, peak_ranking_
         main_anchor_target=batch["main_anchor_target"], main_anchor_mask=batch["main_anchor_mask"],
         empty_peak_weight=empty_peak_weight,
         peak_ranking_weight=peak_ranking_weight,
+        peak_presence=peak_presence,
+        presence_loss_weight=presence_loss_weight,
+        main_anchor_logits=output.get("main_anchor_logits"),
     )
 
 
@@ -90,19 +94,22 @@ def _intensity_diagnostics(prediction, target, valid):
     return metrics, torch.stack(band_counts, dim=1)
 
 
-def _sample_metrics(output, batch):
+def _sample_metrics(output, batch, *, peak_presence=False):
     prediction, target, valid = output["prediction"], batch["target"], batch["valid_mask"]
     positive = (target > 0) & valid
-    anchor_mask = batch["main_anchor_mask"]
-    anchor_target = (batch["main_anchor_target"] > 0) & anchor_mask
+    anchor_mask = valid if peak_presence else batch["main_anchor_mask"]
+    anchor_target = ((target > _DENSITY_THRESHOLD) if peak_presence
+                     else (batch["main_anchor_target"] > 0)) & anchor_mask
     anchor_prediction = (output["main_anchor_prob"] >= ANCHOR_PROBABILITY_THRESHOLD) & anchor_mask
     anchor_tp = (anchor_prediction & anchor_target).flatten(1).sum(1)
     metrics = {
         "cosine": _cosine_per_sample(prediction, target, valid),
         "masked_mae": _masked_mae_per_sample(prediction, target, valid),
         "positive_mae": _masked_mae_per_sample(prediction, target, positive),
-        "anchor_precision": anchor_tp / anchor_prediction.flatten(1).sum(1).clamp_min(1),
-        "anchor_recall": anchor_tp / anchor_target.flatten(1).sum(1).clamp_min(1),
+        "peak_head_precision_at_0p5" if peak_presence else "anchor_precision":
+            anchor_tp / anchor_prediction.flatten(1).sum(1).clamp_min(1),
+        "peak_head_recall_at_0p5" if peak_presence else "anchor_recall":
+            anchor_tp / anchor_target.flatten(1).sum(1).clamp_min(1),
         "zero_positive": ~positive.flatten(1).any(1),
     }
     intensity_metrics, band_counts = _intensity_diagnostics(prediction, target, valid)
@@ -131,7 +138,7 @@ def _chain_length_metrics(rows, short, charges, charge_values):
 
 
 @torch.inference_mode()
-def evaluate_xl(model, loader, device, desc=None):
+def evaluate_xl(model, loader, device, desc=None, *, peak_presence=False):
     model.eval()
     charge_batches, metric_batches, chain_batches, short_batches = [], [], [], []
     band_batches = []
@@ -146,7 +153,7 @@ def evaluate_xl(model, loader, device, desc=None):
         for batch in batches:
             batch = prepare_xl_batch(batch, device)
             output = predict_xl_batch(model, batch)
-            metrics, band_counts = _sample_metrics(output, batch)
+            metrics, band_counts = _sample_metrics(output, batch, peak_presence=peak_presence)
             names = tuple(metrics)
             rows = torch.stack(tuple(metrics.values()), dim=1).cpu()
             charge_batches.append(batch["precursor_charge"].cpu())

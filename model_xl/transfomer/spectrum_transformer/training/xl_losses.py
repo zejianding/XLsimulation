@@ -54,6 +54,32 @@ def _peak_ranking_loss(prediction, target, valid_mask):
     return torch.stack(group_losses).sum() / torch.stack(eligible_groups).sum().clamp_min(1)
 
 
+def _peak_presence_loss(logits, target, valid_mask):
+    """Balance present/absent classes within each peptide-pair and ion family."""
+    labels = target > MAIN_PEAK_THRESHOLD
+    cell_loss = F.binary_cross_entropy_with_logits(logits.float(), labels.float(), reduction="none")
+    group_losses, eligible_groups = [], []
+    diagnostics = {}
+    for name, tokens in (("main", MAIN_TOKEN_IDS), ("satellite", SATELLITE_TOKEN_IDS),
+                         ("residue_event", RESIDUE_EVENT_TOKEN_IDS)):
+        values = cell_loss[..., tokens, :].flatten(1)
+        valid = valid_mask[..., tokens, :].flatten(1)
+        positive = labels[..., tokens, :].flatten(1) & valid
+        negative = ~labels[..., tokens, :].flatten(1) & valid
+        positive_count, negative_count = positive.sum(1), negative.sum(1)
+        positive_loss = values.masked_fill(~positive, 0.0).sum(1) / positive_count.clamp_min(1)
+        negative_loss = values.masked_fill(~negative, 0.0).sum(1) / negative_count.clamp_min(1)
+        present_classes = (positive_count > 0).float() + (negative_count > 0).float()
+        group_loss = (positive_loss + negative_loss) / present_classes.clamp_min(1)
+        eligible = present_classes > 0
+        group_losses.append(group_loss)
+        eligible_groups.append(eligible)
+        diagnostics[f"presence_{name}_bce"] = group_loss.sum() / eligible.sum().clamp_min(1)
+        diagnostics[f"presence_{name}_positive_fraction"] = positive.sum() / valid.sum().clamp_min(1)
+    loss = torch.stack(group_losses).sum() / torch.stack(eligible_groups).sum().clamp_min(1)
+    return loss, diagnostics
+
+
 def xl_compound_loss(
     prediction,
     target,
@@ -66,6 +92,9 @@ def xl_compound_loss(
     main_anchor_mask=None,
     empty_peak_weight=0.0,
     peak_ranking_weight=0.0,
+    peak_presence=False,
+    presence_loss_weight=0.45,
+    main_anchor_logits=None,
 ):
     """Return the scalar loss and its components for grids shaped ``(B, 2, H, T, C)``."""
     if prediction.ndim != 5 or prediction.shape[1] != 2:
@@ -79,6 +108,7 @@ def xl_compound_loss(
         ("main_anchor_prob", main_anchor_prob),
         ("main_anchor_target", main_anchor_target),
         ("main_anchor_mask", main_anchor_mask),
+        ("main_anchor_logits", main_anchor_logits),
     ):
         if grid is not None and grid.shape != prediction.shape:
             raise ValueError(f"{name} must match the XL prediction shape")
@@ -101,17 +131,22 @@ def xl_compound_loss(
     # Amplitude uses local maxima of the full grid. Anchor BCE uses only the main token.
     strong_peaks = _local_peaks(target, valid_mask) & (target >= MAIN_PEAK_THRESHOLD)
     main_peak_amp = weighted_masked_l1(prediction, target, strong_peaks & shared)
-    anchor_valid = main_valid if main_anchor_mask is None else main_valid & main_anchor_mask[..., MAIN_TOKEN_IDS, :].bool()
-    if main_anchor_target is None:
-        anchor_labels = (_local_peaks(main_target, anchor_valid) & (main_target >= MAIN_PEAK_THRESHOLD)).float()
+    if peak_presence:
+        if main_anchor_logits is None:
+            raise ValueError("Full-grid peak presence requires main_anchor_logits")
+        shared_anchor, presence_diagnostics = _peak_presence_loss(main_anchor_logits, target, valid_mask)
     else:
-        anchor_labels = main_anchor_target[..., MAIN_TOKEN_IDS, :].float()
-    anchor_prob = main_anchor_prob[..., MAIN_TOKEN_IDS, :].float().clamp(1e-6, 1.0 - 1e-6)
-    cell_bce = F.binary_cross_entropy(anchor_prob, anchor_labels, reduction="none")
-    subthreshold = main_target < MAIN_PEAK_THRESHOLD
-    shared_anchor = _weighted_anchor_bce(
-        cell_bce, anchor_labels, subthreshold, anchor_valid & shared, negative_weight=0.35, positive_boost=4.0
-    )
+        anchor_valid = main_valid if main_anchor_mask is None else main_valid & main_anchor_mask[..., MAIN_TOKEN_IDS, :].bool()
+        if main_anchor_target is None:
+            anchor_labels = (_local_peaks(main_target, anchor_valid) & (main_target >= MAIN_PEAK_THRESHOLD)).float()
+        else:
+            anchor_labels = main_anchor_target[..., MAIN_TOKEN_IDS, :].float()
+        anchor_prob = main_anchor_prob[..., MAIN_TOKEN_IDS, :].float().clamp(1e-6, 1.0 - 1e-6)
+        cell_bce = F.binary_cross_entropy(anchor_prob, anchor_labels, reduction="none")
+        subthreshold = main_target < MAIN_PEAK_THRESHOLD
+        shared_anchor = _weighted_anchor_bce(
+            cell_bce, anchor_labels, subthreshold, anchor_valid & shared, negative_weight=0.35, positive_boost=4.0
+        )
 
     # Preserve the reported hard-threshold density term and its lack of gradient.
     pred_count = ((prediction >= MAIN_PEAK_THRESHOLD) & valid_mask).flatten(1).sum(dim=1)
@@ -128,7 +163,15 @@ def xl_compound_loss(
         "v20_main_anchor_z23_loss": shared_anchor,
         "v20_density_gap_penalty": density_gap,
     }
-    loss = sum(weight * metrics[name] for name, weight in XL_LOSS_WEIGHTS.items())
+    if peak_presence:
+        # Replace the old auxiliary term with the explicitly configured full-grid loss.
+        loss = sum(weight * metrics[name] for name, weight in XL_LOSS_WEIGHTS.items()
+                   if name != "v20_main_anchor_z23_loss") + presence_loss_weight * shared_anchor
+        del metrics["v20_main_anchor_z23_loss"]
+        metrics["peak_presence_bce"] = shared_anchor
+        metrics.update(presence_diagnostics)
+    else:
+        loss = sum(weight * metrics[name] for name, weight in XL_LOSS_WEIGHTS.items())
     if empty_peak_weight:
         empty_peak_target = target[..., EMPTY_PEAK_TOKEN_IDS, :]
         empty_peak_mask = valid_mask[..., EMPTY_PEAK_TOKEN_IDS, :] & (empty_peak_target == 0)
