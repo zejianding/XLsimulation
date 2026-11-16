@@ -67,6 +67,12 @@ def _smoke_indices(dataset, batch_size, seed):
     return (representatives + remaining)[:batch_size]
 
 
+def _selection_metric(args):
+    return getattr(args, "selection_metric", None) or (
+        "presence-precision" if getattr(args, "peak_presence", False) else "cosine"
+    )
+
+
 def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
     loss_config = {"weights": XL_LOSS_WEIGHTS, "shared_main_peak_weight": 1.0,
                    "main_peak_threshold": MAIN_PEAK_THRESHOLD, "short_chain_max_length": SHORT_CHAIN_MAX_LENGTH,
@@ -86,6 +92,7 @@ def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
             "family_weights": {"main": 1.0, "satellite": 1.0, "residue_event": 1.0},
             "selection_score": "sigmoid(main_anchor_logits)", "amplitude": "prediction",
         }
+    if _selection_metric(args) == "presence-precision":
         selection = {
             "primary": "peak_selection.presence.precision", "feasibility_first": True,
             "prefer_recall_band": True,
@@ -154,8 +161,8 @@ def _peak_selection_metrics(model, loader, device, args, fixed=None):
     }
 
 
-def _selection_score(metrics, peak_presence):
-    if peak_presence:
+def _selection_score(metrics, selection_metric):
+    if selection_metric == "presence-precision":
         calibrated = metrics["peak_selection"]["presence"]
         return (calibrated["feasible"], calibrated["recall_band_satisfied"], calibrated["precision"],
                 metrics["cosine"], -metrics["masked_mae"])
@@ -425,6 +432,7 @@ def _train(model, optimizer, train_data, args, device):
     best_path = args.output_dir / "best.pt"
     final_epoch_path = best_path
     peak_presence = getattr(args, "peak_presence", False)
+    selection_metric = _selection_metric(args)
     save_final_epoch = bool(args.empty_peak_weight or args.peak_ranking_weight or peak_presence)
     best = None
     batch_count = len(train_loader)
@@ -471,7 +479,7 @@ def _train(model, optimizer, train_data, args, device):
         train_losses = {name: total / len(train_data) for name, total in epoch_terms.items()}
         logger.log(json.dumps({"epoch": epoch, "train_loss_terms": train_losses,
                                "validation": validation}, allow_nan=False))
-        score = _selection_score(validation, peak_presence)
+        score = _selection_score(validation, selection_metric)
         is_best = best is None or score > best
         if is_best:
             _save_checkpoint(_checkpoint(model, optimizer, train_data, args, epoch, validation), best_path)
@@ -559,9 +567,12 @@ def main():
     parser.add_argument("--peak-ranking-weight", type=float, default=0.0,
                         help="weight for ranking true peaks above hard zero-target cells per ion family (default: 0)")
     parser.add_argument("--peak-presence", action="store_true",
-                        help="train the auxiliary head on all valid peaks and select by calibrated peak precision")
+                        help="train the auxiliary head on all valid peaks")
     parser.add_argument("--presence-loss-weight", type=float, default=0.45,
                         help="full-grid balanced BCE coefficient with --peak-presence (default: 0.45)")
+    parser.add_argument("--selection-metric", choices=("cosine", "presence-precision"),
+                        help="validation metric for best.pt (default: presence-precision with "
+                             "--peak-presence; cosine otherwise)")
     parser.add_argument("--selection-recall-floor", type=float, default=0.9195575)
     parser.add_argument("--selection-recall-ceiling", type=float, default=0.9200575)
     parser.add_argument("--selection-weak-recall-floor", type=float,
@@ -577,6 +588,8 @@ def main():
         parser.error("--peak-ranking-weight must be finite and nonnegative")
     if not isfinite(args.presence_loss_weight) or args.presence_loss_weight <= 0:
         parser.error("--presence-loss-weight must be finite and positive")
+    if args.selection_metric == "presence-precision" and not args.peak_presence:
+        parser.error("--selection-metric presence-precision requires --peak-presence")
     if not 0 <= args.selection_recall_floor <= args.selection_recall_ceiling <= 1:
         parser.error("selection recall bounds must satisfy 0 <= floor <= ceiling <= 1")
     if args.selection_weak_recall_floor is not None and not 0 <= args.selection_weak_recall_floor <= 1:
