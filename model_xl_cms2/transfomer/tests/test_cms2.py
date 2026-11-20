@@ -8,10 +8,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from spectrum_transformer.config import CMS2_CHANNEL_NAMES, MAIN_TOKEN_IDS
+from spectrum_transformer.config import CMS2_CHANNEL_NAMES, MAIN_TOKEN_IDS, SATELLITE_TOKEN_IDS
 from spectrum_transformer.data.xl_dataset import AUX_FEATURE_NAMES, XLSpectrumDataset, _record_dtype
 from spectrum_transformer.training.xl_engine import FRAGMENT_RECALL_NAMES, evaluate_xl
-from spectrum_transformer.training.xl_losses import _local_peaks, _main_token_ranking_loss
+from spectrum_transformer.training.xl_losses import _local_peaks, _main_token_ranking_loss, _satellite_empty_loss
 
 
 class EchoPrediction(torch.nn.Module):
@@ -59,6 +59,50 @@ class MainTokenRankingTests(unittest.TestCase):
         target[1] = 0
         scores = torch.zeros_like(target, requires_grad=True)
         loss = _main_token_ranking_loss(scores, target, torch.ones_like(target, dtype=torch.bool))
+        self.assertEqual(loss.item(), 0.)
+        loss.backward()
+        torch.testing.assert_close(scores.grad, torch.zeros_like(scores))
+
+
+class SatelliteEmptyTests(unittest.TestCase):
+    def test_top_four_per_group_and_equal_spectrum_weight(self):
+        first, second = SATELLITE_TOKEN_IDS[:2]
+        target = torch.zeros(3, 2, 8, 46, 12)
+        scores = torch.zeros_like(target)
+        valid = torch.zeros_like(target, dtype=torch.bool)
+
+        def set_scores(sample, chain, token, channel, values):
+            cells = (sample, chain, slice(0, len(values)), token, channel)
+            scores[cells] = torch.tensor(values)
+            valid[cells] = True
+
+        set_scores(0, 0, first, 0, [.07, .05, .08, .10, .14, .19, .99, .98])
+        target[0, 0, 6, first, 0] = .001  # a weak observation is still occupied
+        valid[0, 0, 7, first, 0] = False
+        set_scores(0, 0, first, 1, [.05, .25])
+        set_scores(0, 1, first, 0, [.11])
+        set_scores(0, 0, second, 0, [.04])  # eligible group with zero penalty
+        set_scores(1, 0, first, 0, [.35])
+        set_scores(2, 0, MAIN_TOKEN_IDS[0], 0, [.99])
+        set_scores(2, 0, 0, 0, [.98])  # residue-event token
+
+        scores.requires_grad_()
+        loss = _satellite_empty_loss(scores, target, valid)
+        self.assertAlmostEqual(loss.item(), ((.0775 + .10 + .06 + 0) / 4 + .30) / 2)
+        loss.backward()
+        expected = torch.zeros_like(scores)
+        expected[0, 0, 2:6, first, 0] = 1 / 32
+        expected[0, 0, 1, first, 1] = 1 / 16
+        expected[0, 1, 0, first, 0] = 1 / 8
+        expected[1, 0, 0, first, 0] = 1 / 2
+        torch.testing.assert_close(scores.grad, expected)
+
+    def test_no_valid_empty_satellite_is_differentiable_zero(self):
+        scores = torch.ones(2, 2, 2, 46, 12, requires_grad=True)
+        valid = torch.ones_like(scores, dtype=torch.bool)
+        valid[0] = False
+        target = valid.float()  # invalid zeros in spectrum 0; observed peaks in spectrum 1
+        loss = _satellite_empty_loss(scores, target, valid)
         self.assertEqual(loss.item(), 0.)
         loss.backward()
         torch.testing.assert_close(scores.grad, torch.zeros_like(scores))

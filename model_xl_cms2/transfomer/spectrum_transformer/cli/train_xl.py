@@ -35,7 +35,7 @@ from spectrum_transformer.training.xl_engine import (
 )
 from spectrum_transformer.training.xl_losses import (
     MAIN_PEAK_THRESHOLD, MAIN_TOKEN_RANKING_MARGIN, PEAK_RANKING_MARGIN, PEAK_RANKING_TOP_K,
-    SHORT_CHAIN_MAX_LENGTH, XL_LOSS_WEIGHTS,
+    SATELLITE_EMPTY_THRESHOLD, SATELLITE_EMPTY_TOP_K, SHORT_CHAIN_MAX_LENGTH, XL_LOSS_WEIGHTS,
 )
 from spectrum_transformer.training.xl_peak_evaluation import evaluate_xl_peak_selection
 from spectrum_transformer.warnings import configure_v20_warning_filters
@@ -94,6 +94,12 @@ def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
         "positive_target_gt": MAIN_PEAK_THRESHOLD, "negative_target_eq": 0.0,
         "score": "prediction", "pairs": "all valid positive/empty cleavages within one chain and channel",
         "reduction": "mean over pairs, then eligible chain/channel groups, then eligible spectra",
+    }
+    loss_config["satellite_empty"] = {
+        "token_ids": SATELLITE_TOKEN_IDS, "top_k": SATELLITE_EMPTY_TOP_K,
+        "threshold": SATELLITE_EMPTY_THRESHOLD, "score": "prediction",
+        "candidates": "valid & (target == 0)", "group_by": ("chain", "token", "fragment_channel"),
+        "reduction": "mean hinge over selected cleavages, then eligible groups, then eligible spectra",
     }
     if args.peak_ranking_weight:
         loss_config["peak_ranking"] = {"weight": args.peak_ranking_weight, "top_k": PEAK_RANKING_TOP_K,

@@ -13,6 +13,8 @@ from .target_processing import build_main_peak_mask
 
 MAIN_PEAK_THRESHOLD = 0.03
 MAIN_TOKEN_RANKING_MARGIN = 0.02
+SATELLITE_EMPTY_TOP_K = 4
+SATELLITE_EMPTY_THRESHOLD = 0.05
 SHORT_CHAIN_MAX_LENGTH = 16
 EMPTY_PEAK_TOKEN_IDS = MAIN_TOKEN_IDS + SATELLITE_TOKEN_IDS
 PEAK_RANKING_TOP_K = 8
@@ -24,6 +26,7 @@ XL_LOSS_WEIGHTS = {
     "v20_main_anchor_z23_loss": 0.45,
     "v20_density_gap_penalty": 0.15,
     "main_token_ranking_loss": 1.0,
+    "satellite_empty_loss": 0.1,
 }
 
 
@@ -54,6 +57,21 @@ def _main_token_ranking_loss(prediction, target, valid_mask):
     group_losses = violations.masked_fill(~pairs, 0.0).sum(dim=(-2, -1)) / pair_counts.clamp_min(1)
     groups_per_spectrum = (pair_counts > 0).sum(dim=(1, 2))
     spectrum_losses = group_losses.sum(dim=(1, 2)) / groups_per_spectrum.clamp_min(1)
+    return spectrum_losses.sum() / (groups_per_spectrum > 0).sum().clamp_min(1)
+
+
+def _satellite_empty_loss(prediction, target, valid_mask):
+    """Penalize the highest predicted empty cleavages per chain, satellite token and channel."""
+    scores = prediction[..., SATELLITE_TOKEN_IDS, :]
+    empty = valid_mask[..., SATELLITE_TOKEN_IDS, :] & (target[..., SATELLITE_TOKEN_IDS, :] == 0)
+    k = min(SATELLITE_EMPTY_TOP_K, scores.size(2))
+    # Axis 2 is cleavage. Padding a short group's top-k with -inf gives zero hinge loss.
+    top_scores = scores.masked_fill(~empty, -torch.inf).topk(k, dim=2).values
+    selected_counts = empty.sum(dim=2).clamp_max(k)
+    penalties = F.relu(top_scores - SATELLITE_EMPTY_THRESHOLD)
+    group_losses = penalties.sum(dim=2) / selected_counts.clamp_min(1)
+    groups_per_spectrum = (selected_counts > 0).flatten(1).sum(1)
+    spectrum_losses = group_losses.flatten(1).sum(1) / groups_per_spectrum.clamp_min(1)
     return spectrum_losses.sum() / (groups_per_spectrum > 0).sum().clamp_min(1)
 
 
@@ -185,6 +203,7 @@ def xl_compound_loss(
         "v20_main_anchor_z23_loss": shared_anchor,
         "v20_density_gap_penalty": density_gap,
         "main_token_ranking_loss": _main_token_ranking_loss(prediction, target, valid_mask),
+        "satellite_empty_loss": _satellite_empty_loss(prediction, target, valid_mask),
     }
     if peak_presence:
         # Replace the old auxiliary term with the explicitly configured full-grid loss.
