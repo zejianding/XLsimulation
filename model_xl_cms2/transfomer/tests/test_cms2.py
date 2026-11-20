@@ -1,4 +1,4 @@
-"""Regression tests for the cMS2 plain/short boundary and fragment recall."""
+"""Regression tests for cMS2 peak selection, ranking and fragment recall."""
 
 import json
 import tempfile
@@ -11,12 +11,57 @@ import torch
 from spectrum_transformer.config import CMS2_CHANNEL_NAMES, MAIN_TOKEN_IDS
 from spectrum_transformer.data.xl_dataset import AUX_FEATURE_NAMES, XLSpectrumDataset, _record_dtype
 from spectrum_transformer.training.xl_engine import FRAGMENT_RECALL_NAMES, evaluate_xl
-from spectrum_transformer.training.xl_losses import _local_peaks
+from spectrum_transformer.training.xl_losses import _local_peaks, _main_token_ranking_loss
 
 
 class EchoPrediction(torch.nn.Module):
     def forward(self, x, aux_features, **kwargs):
         return {"prediction": x, "main_anchor_prob": torch.zeros_like(x)}
+
+
+class MainTokenRankingTests(unittest.TestCase):
+    def test_all_pairs_are_averaged_by_group_then_spectrum(self):
+        main = MAIN_TOKEN_IDS[0]
+        target = torch.zeros(3, 2, 8, 46, 12)
+        scores = torch.zeros_like(target)
+        valid = torch.zeros_like(target, dtype=torch.bool)
+
+        def group(sample, chain, channel, labels, predictions, token=main):
+            cells = (sample, chain, slice(0, len(labels)), token, channel)
+            target[cells] = torch.tensor(labels, dtype=target.dtype)
+            scores[cells] = torch.tensor(predictions)
+            valid[cells] = True
+
+        # Two positive cuts x two empty cuts: penalties 0, 0, .04, .06.
+        group(0, 0, 0, [.6, .1, 0, 0, .03, .01], [.15, .08, .10, .12, .99, .99])
+        scores[0, 0, 6, main, 0] = .99  # invalid zero-target cut
+        group(0, 1, 0, [.1, 0], [.03, .07])  # group mean .06
+        group(1, 0, 9, [.1, 0], [.10, .10])  # group mean .02
+        # Neither different channels, chains, spectra nor neighboring tokens may supply a pair.
+        group(0, 0, 1, [.8], [.01])
+        group(0, 0, 2, [0], [.99])
+        group(0, 1, 1, [0], [.99])
+        group(2, 0, 1, [0], [.99])
+        group(2, 0, 1, [.8, 0], [.01, .99], token=main + 1)
+
+        scores.requires_grad_()
+        loss = _main_token_ranking_loss(scores, target, valid)
+        self.assertAlmostEqual(loss.item(), ((.025 + .06) / 2 + .02) / 2)
+        loss.backward()
+        expected_grad = torch.zeros_like(scores)
+        expected_grad[0, 0, 1:4, main, 0] = torch.tensor([-.125, .0625, .0625])
+        expected_grad[0, 1, :2, main, 0] = torch.tensor([-.25, .25])
+        expected_grad[1, 0, :2, main, 9] = torch.tensor([-.5, .5])
+        torch.testing.assert_close(scores.grad, expected_grad)
+
+    def test_batch_without_eligible_pairs_has_zero_loss_and_gradient(self):
+        target = torch.ones(2, 2, 3, 46, 12)
+        target[1] = 0
+        scores = torch.zeros_like(target, requires_grad=True)
+        loss = _main_token_ranking_loss(scores, target, torch.ones_like(target, dtype=torch.bool))
+        self.assertEqual(loss.item(), 0.)
+        loss.backward()
+        torch.testing.assert_close(scores.grad, torch.zeros_like(scores))
 
 
 class CMS2Tests(unittest.TestCase):

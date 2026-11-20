@@ -12,6 +12,7 @@ from .target_processing import build_main_peak_mask
 
 
 MAIN_PEAK_THRESHOLD = 0.03
+MAIN_TOKEN_RANKING_MARGIN = 0.02
 SHORT_CHAIN_MAX_LENGTH = 16
 EMPTY_PEAK_TOKEN_IDS = MAIN_TOKEN_IDS + SATELLITE_TOKEN_IDS
 PEAK_RANKING_TOP_K = 8
@@ -22,6 +23,7 @@ XL_LOSS_WEIGHTS = {
     "v20_family_weighted_loss": 0.35,
     "v20_main_anchor_z23_loss": 0.45,
     "v20_density_gap_penalty": 0.15,
+    "main_token_ranking_loss": 1.0,
 }
 
 
@@ -33,6 +35,26 @@ def _local_peaks(target, valid_mask):
 def _weighted_anchor_bce(cell_bce, anchor_labels, subthreshold, cell_weight, *, negative_weight, positive_boost):
     peak_weight = 1.0 + positive_boost * anchor_labels + negative_weight * subthreshold
     return (cell_bce * peak_weight * cell_weight).sum() / cell_weight.sum().clamp_min(1.0)
+
+
+def _main_token_ranking_loss(prediction, target, valid_mask):
+    """Rank observed main-token peaks above empty cleavages within each chain/channel."""
+    token = MAIN_TOKEN_IDS[0]
+    # (spectrum, chain, channel, cleavage); the last two pair axes below are cuts.
+    scores = prediction[..., token, :].transpose(-1, -2)
+    labels = target[..., token, :].transpose(-1, -2)
+    valid = valid_mask[..., token, :].transpose(-1, -2)
+    positive = valid & (labels > MAIN_PEAK_THRESHOLD)
+    empty = valid & (labels == 0)
+    pairs = positive.unsqueeze(-1) & empty.unsqueeze(-2)
+    gaps = scores.unsqueeze(-1) - scores.unsqueeze(-2)
+    violations = F.relu(MAIN_TOKEN_RANKING_MARGIN - gaps)
+
+    pair_counts = pairs.sum(dim=(-2, -1))
+    group_losses = violations.masked_fill(~pairs, 0.0).sum(dim=(-2, -1)) / pair_counts.clamp_min(1)
+    groups_per_spectrum = (pair_counts > 0).sum(dim=(1, 2))
+    spectrum_losses = group_losses.sum(dim=(1, 2)) / groups_per_spectrum.clamp_min(1)
+    return spectrum_losses.sum() / (groups_per_spectrum > 0).sum().clamp_min(1)
 
 
 def _peak_ranking_loss(prediction, target, valid_mask):
@@ -162,6 +184,7 @@ def xl_compound_loss(
         "v20_family_weighted_loss": family_weighted_recon,
         "v20_main_anchor_z23_loss": shared_anchor,
         "v20_density_gap_penalty": density_gap,
+        "main_token_ranking_loss": _main_token_ranking_loss(prediction, target, valid_mask),
     }
     if peak_presence:
         # Replace the old auxiliary term with the explicitly configured full-grid loss.
