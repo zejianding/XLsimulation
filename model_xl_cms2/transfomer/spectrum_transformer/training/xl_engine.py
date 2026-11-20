@@ -1,0 +1,230 @@
+"""Batch execution and validation for paired XL spectra."""
+
+from contextlib import nullcontext
+
+import torch
+from tqdm import tqdm
+
+from spectrum_transformer.config import CMS2_NUM_CHANNELS, MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS, SATELLITE_TOKEN_IDS
+from spectrum_transformer.training.engine import PEAK_RECALL_BANDS, _cosine_per_sample, _masked_mae_per_sample
+from spectrum_transformer.training.xl_losses import SHORT_CHAIN_MAX_LENGTH, xl_compound_loss
+
+
+_TRAINING_FIELDS = (
+    "input", "target", "valid_mask", "aux_features", "precursor_charge", "lengths", "link_sites", "linker_id",
+    "cleavage_aa_ids", "cleavage_scalar_features", "main_anchor_target", "main_anchor_mask",
+)
+_TOKEN_FAMILIES = {
+    "main": MAIN_TOKEN_IDS,
+    "satellite": SATELLITE_TOKEN_IDS,
+    "residue_event": RESIDUE_EVENT_TOKEN_IDS,
+}
+ANCHOR_PROBABILITY_THRESHOLD = 0.5
+_DENSITY_THRESHOLD = 0.03
+_PRESENCE_PREDICTION_THRESHOLD = 0.05
+FRAGMENT_RECALL_NAMES = ("plain_recall", "short_recall", "long_recall",
+                         "fragment_z1_recall", "fragment_z2_recall", "fragment_z3_recall")
+
+
+def prepare_xl_batch(batch, device):
+    return {name: batch[name].to(device, non_blocking=True) for name in _TRAINING_FIELDS if name in batch}
+
+
+def predict_xl_batch(model, batch):
+    return model(
+        batch["input"], batch["aux_features"], valid_mask=batch["valid_mask"],
+        charge=batch["precursor_charge"], lengths=batch["lengths"],
+        linker_id=batch.get("linker_id"),
+        cleavage_aa_ids=batch["cleavage_aa_ids"],
+        cleavage_scalar_features=batch["cleavage_scalar_features"],
+    )
+
+
+def compute_xl_batch_loss(output, batch, *, empty_peak_weight=0.0, peak_ranking_weight=0.0,
+                          peak_presence=False, presence_loss_weight=0.45):
+    return xl_compound_loss(
+        output["prediction"], batch["target"], batch["valid_mask"],
+        charges=batch["precursor_charge"], lengths=batch["lengths"],
+        main_anchor_prob=output["main_anchor_prob"],
+        main_anchor_target=batch["main_anchor_target"], main_anchor_mask=batch["main_anchor_mask"],
+        empty_peak_weight=empty_peak_weight,
+        peak_ranking_weight=peak_ranking_weight,
+        peak_presence=peak_presence,
+        presence_loss_weight=presence_loss_weight,
+        main_anchor_logits=output.get("main_anchor_logits"),
+    )
+
+
+def xl_density_per_sample(prediction, target, valid_mask):
+    """Return prediction and target density above 0.03 for each complete XL pair."""
+    valid_cells = valid_mask.flatten(1).sum(1).clamp_min(1)
+    pred_nz = ((prediction > _DENSITY_THRESHOLD) & valid_mask).flatten(1).sum(1) / valid_cells
+    target_nz = ((target > _DENSITY_THRESHOLD) & valid_mask).flatten(1).sum(1) / valid_cells
+    return pred_nz, target_nz
+
+
+def _fragment_peak_counts(peaks, link_sites):
+    """Count valid peak cells per sample by fragment state and fragment charge."""
+    by_channel = peaks.sum(dim=3)  # sum tokens, keep chain and cleavage
+    cuts = torch.arange(1, peaks.size(2) + 1, device=peaks.device)
+    b_contains_site = cuts >= link_sites.unsqueeze(-1)
+    b = by_channel[..., :3].sum(-1)
+    y = by_channel[..., 3:6].sum(-1)
+    states = torch.stack((
+        torch.where(b_contains_site, y, b).sum((1, 2)),
+        torch.where(b_contains_site, b, y).sum((1, 2)),
+        by_channel[..., 6:].sum((1, 2, 3)),
+    ), dim=1)
+    # Both arms have B1+, B2+, B3+, Y1+, Y2+, Y3+ in that order.
+    charges = by_channel.sum((1, 2)).reshape(peaks.size(0), 4, 3).sum(1)
+    return torch.cat((states, charges), dim=1)
+
+
+def _intensity_diagnostics(prediction, target, valid, link_sites):
+    pred_nz, target_nz = xl_density_per_sample(prediction, target, valid)
+    valid_cells = valid.flatten(1).sum(1).clamp_min(1)
+    prediction_energy = (prediction * valid).flatten(1).sum(1) / valid_cells
+    target_energy = (target * valid).flatten(1).sum(1) / valid_cells
+
+    predicted_peaks = (prediction > _PRESENCE_PREDICTION_THRESHOLD) & valid
+    target_peaks = (target > _DENSITY_THRESHOLD) & valid
+    predicted_count = predicted_peaks.flatten(1).sum(1)
+    target_count = target_peaks.flatten(1).sum(1)
+    hit_count = (predicted_peaks & target_peaks).flatten(1).sum(1)
+    metrics = {
+        "pred_nonzero_ratio": pred_nz,
+        "target_nonzero_ratio": target_nz,
+        "density_gap": pred_nz - target_nz,
+        "prediction_energy": prediction_energy,
+        "target_energy": target_energy,
+        "energy_gap": prediction_energy - target_energy,
+        "presence_precision": hit_count / predicted_count.clamp_min(1),
+        "presence_recall": hit_count / target_count.clamp_min(1),
+        "presence_f1": 2 * hit_count / (predicted_count + target_count).clamp_min(1),
+    }
+    # V20 bands are in percent of the normalization scale before the square root.
+    intensity_percent = target.clamp_min(0).square() * 100
+    band_counts = []
+    for _, lower, upper in PEAK_RECALL_BANDS:
+        band = (intensity_percent >= lower) & valid
+        if upper is not None:
+            band &= intensity_percent < upper
+        band_hits = (band & predicted_peaks).flatten(1).sum(1)
+        band_counts.append(torch.stack((band_hits, band.flatten(1).sum(1)), dim=1))
+    counts = torch.stack(band_counts, dim=1)
+    if prediction.size(-1) == CMS2_NUM_CHANNELS:
+        fragment_counts = torch.stack((
+            _fragment_peak_counts(predicted_peaks & target_peaks, link_sites),
+            _fragment_peak_counts(target_peaks, link_sites),
+        ), dim=-1)
+        counts = torch.cat((counts, fragment_counts), dim=1)
+    return metrics, counts
+
+
+def _sample_metrics(output, batch, *, peak_presence=False):
+    prediction, target, valid = output["prediction"], batch["target"], batch["valid_mask"]
+    positive = (target > 0) & valid
+    anchor_mask = valid if peak_presence else batch["main_anchor_mask"]
+    anchor_target = ((target > _DENSITY_THRESHOLD) if peak_presence
+                     else (batch["main_anchor_target"] > 0)) & anchor_mask
+    anchor_prediction = (output["main_anchor_prob"] >= ANCHOR_PROBABILITY_THRESHOLD) & anchor_mask
+    anchor_tp = (anchor_prediction & anchor_target).flatten(1).sum(1)
+    metrics = {
+        "cosine": _cosine_per_sample(prediction, target, valid),
+        "masked_mae": _masked_mae_per_sample(prediction, target, valid),
+        "positive_mae": _masked_mae_per_sample(prediction, target, positive),
+        "peak_head_precision_at_0p5" if peak_presence else "anchor_precision":
+            anchor_tp / anchor_prediction.flatten(1).sum(1).clamp_min(1),
+        "peak_head_recall_at_0p5" if peak_presence else "anchor_recall":
+            anchor_tp / anchor_target.flatten(1).sum(1).clamp_min(1),
+        "zero_positive": ~positive.flatten(1).any(1),
+    }
+    intensity_metrics, recall_counts = _intensity_diagnostics(prediction, target, valid, batch.get("link_sites"))
+    metrics.update(intensity_metrics)
+    for name, tokens in _TOKEN_FAMILIES.items():
+        family_pred, family_target, family_valid = (x[..., tokens, :] for x in (prediction, target, valid))
+        metrics[f"{name}_cosine"] = _cosine_per_sample(family_pred, family_target, family_valid)
+        metrics[f"{name}_masked_mae"] = _masked_mae_per_sample(family_pred, family_target, family_valid)
+    return metrics, recall_counts
+
+
+def _chain_length_metrics(rows, short, charges, charge_values):
+    def summarize(selected):
+        if not len(selected):
+            return {"chains": 0, "cosine": None, "masked_mae": None}
+        cosine, masked_mae = selected.mean(dim=0).tolist()
+        return {"chains": len(selected), "cosine": cosine, "masked_mae": masked_mae}
+
+    report = {}
+    for name, mask in (("short", short), ("long", ~short)):
+        report[name] = summarize(rows[mask])
+        report[name]["by_charge"] = {
+            str(charge): summarize(rows[mask & (charges == charge)]) for charge in charge_values
+        }
+    return report
+
+
+@torch.inference_mode()
+def evaluate_xl(model, loader, device, desc=None, *, peak_presence=False):
+    model.eval()
+    charge_batches, metric_batches, chain_batches, short_batches = [], [], [], []
+    recall_batches = []
+    running_cosine = running_mae = 0.0
+    evaluated = 0
+    iterator = (
+        tqdm(loader, desc=desc, unit="batch", leave=False, dynamic_ncols=True, disable=None)
+        if desc is not None else nullcontext(loader)
+    )
+    with iterator as batches:
+        show_progress = desc is not None and not batches.disable
+        for batch in batches:
+            batch = prepare_xl_batch(batch, device)
+            output = predict_xl_batch(model, batch)
+            metrics, recall_counts = _sample_metrics(output, batch, peak_presence=peak_presence)
+            names = tuple(metrics)
+            rows = torch.stack(tuple(metrics.values()), dim=1).cpu()
+            charge_batches.append(batch["precursor_charge"].cpu())
+            metric_batches.append(rows)
+            recall_batches.append(recall_counts.cpu())
+
+            chain_pred = output["prediction"].flatten(0, 1)
+            chain_target = batch["target"].flatten(0, 1)
+            chain_valid = batch["valid_mask"].flatten(0, 1)
+            chain_cosine = _cosine_per_sample(chain_pred, chain_target, chain_valid)
+            chain_mae = _masked_mae_per_sample(chain_pred, chain_target, chain_valid)
+            chain_batches.append(torch.stack((chain_cosine, chain_mae), dim=1).cpu())
+            short_batches.append((batch["lengths"].flatten() <= SHORT_CHAIN_MAX_LENGTH).cpu())
+
+            if show_progress:
+                evaluated += len(rows)
+                running_cosine += rows[:, names.index("cosine")].sum().item()
+                running_mae += rows[:, names.index("masked_mae")].sum().item()
+                batches.set_postfix(cosine=f"{running_cosine / evaluated:.4f}",
+                                    mae=f"{running_mae / evaluated:.4f}", refresh=False)
+    if not metric_batches:
+        raise ValueError("Cannot evaluate an empty XL split")
+
+    charges = torch.cat(charge_batches)
+    charge_values = charges.unique().tolist()
+    rows = torch.cat(metric_batches)
+    recall_counts = torch.cat(recall_batches)
+
+    def summarize(group, counts):
+        averages = dict(zip(names, group.mean(dim=0).tolist()))
+        del averages["zero_positive"]
+        averages["samples"] = len(group)
+        averages["zero_positive_samples"] = int(group[:, names.index("zero_positive")].sum())
+        recall_names = tuple(name for name, _, _ in PEAK_RECALL_BANDS) + FRAGMENT_RECALL_NAMES
+        for name, (hits, peaks) in zip(recall_names, counts.sum(dim=0).tolist()):
+            averages[name] = hits / peaks if peaks else None
+        return averages
+
+    report = summarize(rows, recall_counts)
+    report["by_charge"] = {}
+    for charge in charge_values:
+        selected = charges == charge
+        report["by_charge"][str(charge)] = summarize(rows[selected], recall_counts[selected])
+    report["by_chain_length"] = _chain_length_metrics(
+        torch.cat(chain_batches), torch.cat(short_batches), charges.repeat_interleave(2), charge_values
+    )
+    return report
