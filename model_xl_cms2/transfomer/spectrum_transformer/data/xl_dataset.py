@@ -11,7 +11,8 @@ import torch
 from torch.utils.data import Dataset
 
 from ..config import (
-    CHANNEL_NAMES, CMS2_CHANNEL_NAMES, CMS2_FRAGMENT_CHARGES, CMS2_LINKER_IDS, CMS2_NUM_CHANNELS,
+    CHANNEL_NAMES, CMS2_CHANNEL_NAMES, CMS2_FRAGMENT_CHARGES, CMS2_INTACT_CHANNELS, CMS2_INTACT_ROW,
+    CMS2_LINKER_IDS, CMS2_NUM_CHANNELS,
     CMS2_SCHEMA_VERSION, DEFAULT_MIN_VALID_MZ, MAIN_TOKEN_IDS, MAX_CLEAVAGE_LEN, MAX_PEPTIDE_LEN, NUM_TOKENS,
 )
 from ..training.target_processing import build_main_peak_mask
@@ -67,6 +68,38 @@ def _record_dtype(widths, input_shape, target_shape):
         ],
         align=True,
     )
+
+
+def _append_intact_row(grid, values):
+    # Both arrays use the canonical v4 chain order; flatten only (stub, charge).
+    row = np.zeros((*grid.shape[:2], 1, *grid.shape[3:]), dtype=grid.dtype)
+    row[:, :, 0, _MAIN_TOKEN, :][..., CMS2_INTACT_CHANNELS] = values.reshape(*grid.shape[:2], 6)
+    return np.concatenate((grid, row), axis=2)
+
+
+def _load_intact_labels(directory, split, records):
+    directory = Path(directory)
+    manifest = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    axes = [["alpha (v4 sequence[0])", "beta (v4 sequence[1])"], ["short", "long"], [1, 2, 3]]
+    if (manifest.get("label_type") != "intact_peptide_stub" or manifest.get("label_schema_version") != 1
+            or manifest.get("axis_values") != axes or manifest.get("target_normalization") != "sqrt_clip"
+            or manifest.get("clip_intensity") != 50000):
+        raise ValueError("Incompatible intact label schema, axis order or intensity scale")
+    labels = np.load(directory / f"{split}.npy", allow_pickle=False)
+    dtype = np.dtype([("group_id", "S64"), ("mz", "<f8", (2, 2, 3)),
+                      ("target", "<f4", (2, 2, 3)), ("valid_mask", "?", (2, 2, 3))])
+    if labels.dtype != dtype or labels.shape != records.shape:
+        raise ValueError(f"{split}: intact label dtype or row count differs from the expected layout")
+    ids = labels["group_id"]
+    if len(np.unique(ids)) != len(ids) or not np.array_equal(ids, records["group_id"]):
+        raise ValueError(f"{split}: intact group_id values must be unique and in v4 row order")
+    mz, target, valid = labels["mz"], labels["target"], labels["valid_mask"]
+    allowed_charge = np.arange(1, 4) <= records["precursor_charge"][:, None, None, None]
+    if (not np.isfinite(mz).all() or not np.array_equal(valid, (mz >= DEFAULT_MIN_VALID_MZ) & allowed_charge)
+            or not np.isfinite(target).all() or ((target < 0) | (target > 1)).any()
+            or mz[~valid].any() or target[~valid].any()):
+        raise ValueError(f"{split}: invalid intact m/z, target or mask")
+    return labels
 
 
 def _normalization_stats(metadata, key, width):
@@ -127,7 +160,7 @@ class XLInputCollator:
         self._mz_mean, self._mz_std = _normalization_stats(metadata, "mz_channels", channels)
         self._aux_mean, self._aux_std = _normalization_stats(metadata, "aux_features", len(AUX_FEATURE_NAMES))
 
-    def __call__(self, records):
+    def __call__(self, records, intact_labels=None):
         count = len(records)
         lengths = np.stack([row["lengths"] for row in records]).astype(np.int64)
         link_sites = np.stack([row["link_sites"] for row in records]).astype(np.int64)
@@ -138,6 +171,9 @@ class XLInputCollator:
             if mz.shape[1:] != _CMS2_GRID_SHAPE:
                 raise ValueError(f"Expected expanded cMS2 m/z grids of shape {_CMS2_GRID_SHAPE}")
             valid = np.isfinite(mz) & (mz >= DEFAULT_MIN_VALID_MZ)
+            if intact_labels is not None:
+                mz = _append_intact_row(mz, intact_labels["mz"])
+                valid = _append_intact_row(valid, intact_labels["valid_mask"])
         else:
             if self.schema_version == 1:
                 mz = mz[:, :, :, None, :] + _TOKEN_OFFSETS
@@ -190,7 +226,7 @@ class XLInputCollator:
 class XLSpectrumDataset(Dataset):
     """Read one XL average-spectrum group per record using a read-only mmap."""
 
-    def __init__(self, dataset_dir, split):
+    def __init__(self, dataset_dir, split, intact_labels_dir=None):
         if split not in ("train", "val", "test"):
             raise ValueError(f"Unknown XL split {split!r}; expected train, val, or test")
         self.dataset_dir = Path(dataset_dir).resolve()
@@ -236,6 +272,12 @@ class XLSpectrumDataset(Dataset):
             raise ValueError(f"{self._records_path} has a record dtype or shape inconsistent with meta.json")
         self._count = len(records)
         self._records = records
+        self.intact_mode = intact_labels_dir is not None
+        if self.intact_mode:
+            if not is_cms2:
+                raise ValueError("Intact labels require a cMS2 v4 dataset")
+            self._intact_labels = _load_intact_labels(intact_labels_dir, split, records)
+            self._intact_indices = {gid: i for i, gid in enumerate(self._intact_labels["group_id"])}
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -259,22 +301,26 @@ class XLSpectrumDataset(Dataset):
         return self._get_records()[index]
 
     def collate_fn(self, records):
-        batch = self._input_collator(records)
+        labels = None
+        values = np.stack([row["target"] for row in records])
+        if self.intact_mode:
+            labels = self._intact_labels[[self._intact_indices[row["group_id"]] for row in records]]
+            values = _append_intact_row(values, labels["target"])
+        batch = self._input_collator(records, labels)
         valid_mask = batch["valid_mask"]
-        target = torch.from_numpy(np.where(
-            valid_mask.numpy(), np.stack([row["target"] for row in records]), np.float32(0)
-        ))
+        target = torch.from_numpy(np.where(valid_mask.numpy(), values, np.float32(0)))
         main_token = slice(_MAIN_TOKEN, _MAIN_TOKEN + 1)
+        backbone = (slice(None), slice(None), slice(CMS2_INTACT_ROW), main_token, slice(None))
         main_anchor_mask = torch.zeros_like(valid_mask)
-        main_anchor_mask[..., main_token, :] = valid_mask[..., main_token, :]
+        main_anchor_mask[backbone] = valid_mask[backbone]
         count = len(records)
         anchor_shape = (count * 2, MAX_CLEAVAGE_LEN, 1, target.shape[-1])
-        main_values = target[..., main_token, :].reshape(anchor_shape)
-        main_valid = main_anchor_mask[..., main_token, :].reshape(anchor_shape)
+        main_values = target[backbone].reshape(anchor_shape)
+        main_valid = main_anchor_mask[backbone].reshape(anchor_shape)
         local_max = build_main_peak_mask(main_values, main_valid)
         positive = local_max * (main_values >= MAIN_ANCHOR_THRESHOLD)
         main_anchor_target = torch.zeros_like(target)
-        main_anchor_target[..., main_token, :] = positive.reshape(count, 2, *anchor_shape[1:])
+        main_anchor_target[backbone] = positive.reshape(count, 2, *anchor_shape[1:])
 
         return {
             **batch,

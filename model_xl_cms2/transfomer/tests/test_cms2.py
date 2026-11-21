@@ -8,10 +8,15 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from spectrum_transformer.config import CMS2_CHANNEL_NAMES, MAIN_TOKEN_IDS, SATELLITE_TOKEN_IDS
+from spectrum_transformer.config import (
+    CMS2_CHANNEL_NAMES, CMS2_INTACT_CHANNELS, CMS2_INTACT_ROW, MAIN_TOKEN_IDS, SATELLITE_TOKEN_IDS,
+)
 from spectrum_transformer.data.xl_dataset import AUX_FEATURE_NAMES, XLSpectrumDataset, _record_dtype
-from spectrum_transformer.training.xl_engine import FRAGMENT_RECALL_NAMES, evaluate_xl
-from spectrum_transformer.training.xl_losses import _local_peaks, _main_token_ranking_loss, _satellite_empty_loss
+from spectrum_transformer.models.xl_transformer import XLSpectrumTransformer
+from spectrum_transformer.training.xl_engine import FRAGMENT_RECALL_NAMES, evaluate_xl, predict_xl_batch
+from spectrum_transformer.training.xl_losses import (
+    XL_LOSS_WEIGHTS, _local_peaks, _main_token_ranking_loss, _satellite_empty_loss, xl_compound_loss,
+)
 
 
 class EchoPrediction(torch.nn.Module):
@@ -108,6 +113,39 @@ class SatelliteEmptyTests(unittest.TestCase):
         torch.testing.assert_close(scores.grad, torch.zeros_like(scores))
 
 
+class IntactLossTests(unittest.TestCase):
+    def test_only_existing_reconstruction_terms_see_the_intact_row(self):
+        row, token, channel = CMS2_INTACT_ROW, MAIN_TOKEN_IDS[0], CMS2_INTACT_CHANNELS[0]
+        target = torch.zeros(1, 2, row + 1, 46, 12)
+        valid = torch.zeros_like(target, dtype=torch.bool)
+        valid[0, 0, row-2:, token, channel] = True
+        # The intense intact target would suppress the last backbone peak if it entered local pooling.
+        target[0, 0, row-1:, token, channel] = torch.tensor([.2, .9])
+        scores = torch.full_like(target, .1)
+
+        def evaluate(p, y, v):
+            return xl_compound_loss(p, y, v, charges=torch.tensor([4]), lengths=torch.tensor([[40, 4]]),
+                                    main_anchor_prob=torch.full_like(p, .45))
+
+        _, backbone = evaluate(scores[:, :, :row], target[:, :, :row], valid[:, :, :row])
+        p = scores.clone().requires_grad_()
+        loss, terms = evaluate(p, target, valid)
+        loss.backward()
+        self.assertNotEqual(p.grad[0, 0, row, token, channel].item(), 0.)
+        self.assertFalse(p.grad[~valid].any())
+        scores[0, 0, row, token, channel] = .8
+        _, changed = evaluate(scores, target, valid)
+        recon = {"v20_backbone_l1", "v20_backbone_cosine_loss", "v20_backbone_global_loss",
+                 "v20_family_weighted_loss", "loss"}
+        for name in recon:
+            self.assertNotAlmostEqual(terms[name], changed[name])
+        for name in terms.keys() - recon:
+            self.assertAlmostEqual(terms[name], backbone[name])
+            self.assertAlmostEqual(terms[name], changed[name])
+        expected = sum(weight * terms[name] for name, weight in XL_LOSS_WEIGHTS.items())
+        np.testing.assert_allclose(terms["loss"], expected, rtol=1e-6)
+
+
 class CMS2Tests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -117,6 +155,7 @@ class CMS2Tests(unittest.TestCase):
         widths = {"sequence_bytes": 4, "crosslinker_bytes": 4}
         dtype = _record_dtype(widths, grid, grid)
         records = np.zeros(2, dtype=dtype)
+        records["group_id"] = [b"one", b"two"]
         records["sequence"] = [b"AKAA", b"AAAK"]
         records["lengths"] = [4, 4]
         records["link_sites"] = [2, 4]
@@ -147,6 +186,78 @@ class CMS2Tests(unittest.TestCase):
         (path / "meta.json").write_text(json.dumps(metadata), encoding="utf-8")
         self.dataset = XLSpectrumDataset(path, "train")
         self.addCleanup(lambda: setattr(self, "dataset", None))  # close the mmap before Windows removes the file
+
+    def intact_labels(self):
+        directory = self.dataset.dataset_dir / "intact"
+        directory.mkdir()
+        dtype = [("group_id", "S64"), ("mz", "<f8", (2, 2, 3)),
+                 ("target", "<f4", (2, 2, 3)), ("valid_mask", "?", (2, 2, 3))]
+        labels = np.zeros(2, dtype=dtype)
+        labels["group_id"] = [b"one", b"two"]
+        labels["mz"] = np.arange(24).reshape(2, 2, 2, 3) + 200
+        labels["target"] = np.arange(24).reshape(2, 2, 2, 3) / 25
+        labels["valid_mask"] = True
+        labels["mz"][0, 0, 0, 0] = 0
+        labels["valid_mask"][0, 0, 0, 0] = False
+        np.save(directory / "train.npy", labels)
+        manifest = {"label_type": "intact_peptide_stub", "label_schema_version": 1,
+                    "axis_values": [["alpha (v4 sequence[0])", "beta (v4 sequence[1])"],
+                                    ["short", "long"], [1, 2, 3]], "target_normalization": "sqrt_clip",
+                    "clip_intensity": 50000}
+        (directory / "meta.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return directory, labels
+
+    def test_intact_collation_and_metrics(self):
+        directory, labels = self.intact_labels()
+        ds = XLSpectrumDataset(self.dataset.dataset_dir, "train", directory)
+        batch = ds.collate_fn([ds[1], ds[0]])
+        row = CMS2_INTACT_ROW
+        channels = list(CMS2_INTACT_CHANNELS)
+        cells = (slice(None), slice(None), row, self.main, channels)
+        for field, key in (("target", "target"), ("mz", "input_theo_mz"), ("valid_mask", "valid_mask")):
+            expected = labels[field][[1, 0]].reshape(2, 2, 6).copy()
+            np.testing.assert_array_equal(batch[key][cells].numpy(), expected)
+        self.assertEqual(batch["valid_mask"][:, :, row].sum().item(), 23)
+        self.assertFalse(batch["main_anchor_mask"][:, :, row].any())
+        expected_input = (batch["input_theo_mz"][cells] - torch.tensor(channels) - 100) / 2
+        torch.testing.assert_close(batch["input"][cells], expected_input.masked_fill(~batch["valid_mask"][cells], 0).float())
+        old_batch = self.dataset.collate_fn([ds[1], ds[0]])
+        for key in ("input", "target", "valid_mask", "main_anchor_target"):
+            torch.testing.assert_close(batch[key][:, :, :row], old_batch[key])
+        # Calling every intact candidate changes no plain/short/long backbone counts.
+        batch["input"].zero_()
+        batch["input"][cells] = batch["valid_mask"][cells].float()
+        report = evaluate_xl(EchoPrediction(), [batch], torch.device("cpu"))
+        self.assertEqual(report["intact_recall"], 1.)
+        self.assertEqual(report["backbone_cosine"], 0.)
+        self.assertGreater(report["cosine"], 0.)
+        self.assertEqual(report["plain_recall"], 0.)
+        self.assertEqual(report["long_recall"], 0.)
+        np.save(directory / "train.npy", labels[::-1])
+        with self.assertRaisesRegex(ValueError, "group_id"):
+            XLSpectrumDataset(self.dataset.dataset_dir, "train", directory)
+
+    def test_intact_uses_main_head_and_preserves_backbone_when_masked(self):
+        directory, _ = self.intact_labels()
+        ds = XLSpectrumDataset(self.dataset.dataset_dir, "train", directory)
+        batch = ds.collate_fn([ds[0], ds[1]])
+        base_batch = self.dataset.collate_fn([ds[0], ds[1]])
+        config = dict(d_model=16, n_heads=2, n_layers=2, ff_dim=32, dropout=0)
+        torch.manual_seed(5)
+        base = XLSpectrumTransformer(**config).eval()
+        torch.manual_seed(5)
+        model = XLSpectrumTransformer(**config, intact_mode=True).eval()
+        pred = predict_xl_batch(model, batch)["prediction"]
+        pred[:, :, CMS2_INTACT_ROW].sum().backward()
+        self.assertGreater(model.backbone_head.main_head[-1].weight.grad.abs().sum().item(), 0.)
+        self.assertGreater(model.intact_position.grad.abs().sum().item(), 0.)
+        for head in (model.backbone_head.satellite_head, model.backbone_head.residue_head):
+            self.assertFalse(head[-1].weight.grad.any())
+        batch["valid_mask"][:, :, CMS2_INTACT_ROW] = False
+        with torch.inference_mode():
+            pred = predict_xl_batch(model, batch)["prediction"]
+            torch.testing.assert_close(pred[:, :, :CMS2_INTACT_ROW], predict_xl_batch(base, base_batch)["prediction"])
+            self.assertFalse(pred[:, :, CMS2_INTACT_ROW].any())
 
     def test_adjacent_plain_short_peaks(self):
         row = self.dataset[0].copy()

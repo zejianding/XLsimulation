@@ -9,6 +9,8 @@ from torch.nn import functional as F
 from spectrum_transformer.config import (
     AUX_FEATURE_DIM,
     CMS2_CHANNEL_NAMES,
+    CMS2_INTACT_LAYOUT,
+    CMS2_INTACT_ROW,
     CMS2_LINKER_IDS,
     CMS2_NUM_CHANNELS,
     CMS2_SCHEMA_VERSION,
@@ -42,6 +44,7 @@ class XLSpectrumTransformer(nn.Module):
         dropout=DEFAULT_DROPOUT,
         aux_dim=AUX_FEATURE_DIM,
         sequence_context_dim=DEFAULT_SEQUENCE_CONTEXT_DIM,
+        intact_mode=False,
     ):
         super().__init__()
         if (in_channels, out_channels) not in ((CMS2_NUM_CHANNELS, CMS2_NUM_CHANNELS),
@@ -51,6 +54,9 @@ class XLSpectrumTransformer(nn.Module):
             raise ValueError("cMS2 requires three continuous auxiliary features.")
         if n_layers < 2:
             raise ValueError("XL requires at least one shared layer and one charge layer.")
+        if intact_mode and in_channels != CMS2_NUM_CHANNELS:
+            raise ValueError("The intact row requires a twelve-channel cMS2 model")
+        self.intact_mode = intact_mode
 
         self.input_proj = nn.Linear(in_channels, d_model)
         self.aux_proj = nn.Linear(aux_dim, d_model)
@@ -94,6 +100,9 @@ class XLSpectrumTransformer(nn.Module):
                      self.backbone_head.residue_head):
             nn.init.constant_(head[-1].bias, -1.00)
         nn.init.constant_(self.main_anchor_head[-1].bias, -0.85)
+        if self.intact_mode:
+            # Initialize after the baseline layers so the same seed reproduces their initialization.
+            self.intact_position = nn.Parameter(torch.randn(1, d_model))
 
     @classmethod
     def from_cms2_checkpoint(cls, checkpoint):
@@ -104,6 +113,8 @@ class XLSpectrumTransformer(nn.Module):
                 or checkpoint.get("linker_ids") != CMS2_LINKER_IDS
                 or (config["in_channels"], config["out_channels"]) != (CMS2_NUM_CHANNELS, CMS2_NUM_CHANNELS)):
             raise ValueError("Incompatible cMS2 checkpoint schema, fragment channels or linker IDs.")
+        if config.get("intact_mode", False) and checkpoint.get("intact_layout") != CMS2_INTACT_LAYOUT:
+            raise ValueError("Incompatible cMS2 checkpoint intact layout")
         model = cls(**config)
         model.load_state_dict(checkpoint["model_state_dict"])
         return model.eval()
@@ -145,8 +156,11 @@ class XLSpectrumTransformer(nn.Module):
         chain_idx = order // (cleavages * tokens)
         cleavage_idx = (order // tokens) % cleavages
         token_idx = order % tokens
+        positions = self.packed_pos_h.weight
+        if self.intact_mode:
+            positions = torch.cat((positions, self.intact_position), dim=0)
         packed = (
-            packed + self.packed_pos_p(chain_idx) + self.packed_pos_h(cleavage_idx)
+            packed + self.packed_pos_p(chain_idx) + F.embedding(cleavage_idx, positions)
             + self.packed_pos_t(token_idx)
         )
         shared = self.shared_encoder(packed, src_key_padding_mask=key_padding_mask)
@@ -172,9 +186,11 @@ class XLSpectrumTransformer(nn.Module):
         cleavage_aa_ids,
         cleavage_scalar_features,
     ):
-        if (x.ndim != 5 or x.shape[1] != 2 or not 1 <= x.shape[2] <= MAX_CLEAVAGE_LEN
+        if (x.ndim != 5 or x.shape[1] != 2 or not 1 <= x.shape[2] <= MAX_CLEAVAGE_LEN + int(self.intact_mode)
                 or x.shape[-2:] != (NUM_TOKENS, self.input_proj.in_features)):
             raise ValueError(f"XL input must have shape (batch, 2, cleavage, {NUM_TOKENS}, {self.input_proj.in_features}).")
+        if self.intact_mode and x.shape[2] != CMS2_INTACT_ROW + 1:
+            raise ValueError("Intact mode requires the backbone grid followed by one intact row")
         if valid_mask.shape != x.shape:
             raise ValueError("XL valid_mask must have the same shape as the input.")
         valid_mask = valid_mask.bool()
@@ -189,6 +205,9 @@ class XLSpectrumTransformer(nn.Module):
         residue = self.aa_embedding(cleavage_aa_ids).mean(dim=-2)
         scalars = self.scalar_proj(cleavage_scalar_features)
         context = self.context_proj(torch.cat((residue, scalars), dim=-1))
+        if self.intact_mode:
+            # No flanking residues or cleavage/site distances exist for a whole peptide.
+            context = F.pad(context, (0, 0, 0, 1))
         charge_context = self.charge_embedding(charge.clamp(0, 7))[:, None, :].expand(-1, 2, -1)
         length_context = self.length_embedding(lengths.clamp(0, MAX_CLEAVAGE_LEN + 1))
         subgroup = self.subgroup_proj(torch.cat((charge_context, length_context), dim=-1))

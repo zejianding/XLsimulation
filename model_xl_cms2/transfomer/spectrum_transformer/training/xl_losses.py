@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from spectrum_transformer.config import MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS, SATELLITE_TOKEN_IDS
+from spectrum_transformer.config import CMS2_INTACT_ROW, MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS, SATELLITE_TOKEN_IDS
 
 from .losses import masked_cosine_loss, masked_l1, weighted_masked_l1
 from .target_processing import build_main_peak_mask
@@ -159,15 +159,22 @@ def xl_compound_loss(
     global_l1 = masked_l1(prediction, target, valid_mask)
     global_cosine = masked_cosine_loss(prediction, target, valid_mask)
 
-    main_target = target[..., MAIN_TOKEN_IDS, :]
-    main_valid = valid_mask[..., MAIN_TOKEN_IDS, :]
-
     family_weight = target.new_zeros((batch_size, target.shape[-2]))
     family_weight[:, RESIDUE_EVENT_TOKEN_IDS] = 1.0
     family_weight[:, SATELLITE_TOKEN_IDS] = 3.0
     family_weight[:, MAIN_TOKEN_IDS] = 8.0
     family_weighted_recon = weighted_masked_l1(prediction, target, valid_mask * family_weight[:, None, None, :, None])
 
+    # Only the reconstruction terms above supervise intact ions. Slice before local pooling.
+    if target.shape[2] == CMS2_INTACT_ROW + 1:
+        backbone = (slice(None), slice(None), slice(CMS2_INTACT_ROW))
+        prediction, target, valid_mask = prediction[backbone], target[backbone], valid_mask[backbone]
+        main_anchor_prob = main_anchor_prob[backbone] if main_anchor_prob is not None else None
+        main_anchor_target = main_anchor_target[backbone] if main_anchor_target is not None else None
+        main_anchor_mask = main_anchor_mask[backbone] if main_anchor_mask is not None else None
+        main_anchor_logits = main_anchor_logits[backbone] if main_anchor_logits is not None else None
+    main_target = target[..., MAIN_TOKEN_IDS, :]
+    main_valid = valid_mask[..., MAIN_TOKEN_IDS, :]
     # Amplitude uses local maxima of the full grid. Anchor BCE uses only the main token.
     strong_peaks = _local_peaks(target, valid_mask) & (target >= MAIN_PEAK_THRESHOLD)
     main_peak_amp = weighted_masked_l1(prediction, target, strong_peaks & shared)

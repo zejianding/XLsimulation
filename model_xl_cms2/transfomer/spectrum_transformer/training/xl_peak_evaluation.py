@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from spectrum_transformer.config import SATELLITE_TOKEN_IDS
+from spectrum_transformer.config import CMS2_INTACT_ROW, SATELLITE_TOKEN_IDS
 from spectrum_transformer.training.xl_engine import predict_xl_batch, prepare_xl_batch
 
 
@@ -154,6 +154,10 @@ def evaluate_xl_peak_selection(
             scores = output["main_anchor_logits"].detach().float().sigmoid().cpu().numpy()
         target = batch["target"].float().cpu().numpy()
         valid = batch["valid_mask"].bool().cpu().numpy()
+        if score_source == "presence" and valid.shape[2] > CMS2_INTACT_ROW:
+            # The auxiliary head is supervised only at backbone positions.
+            valid = valid.copy()
+            valid[:, :, CMS2_INTACT_ROW:] = False
         charges = batch["precursor_charge"].cpu().tolist()
         raw_mz = raw_batch.get("input_theo_mz")
         mz = raw_mz.detach().cpu().numpy() if raw_mz is not None else None

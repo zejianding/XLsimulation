@@ -5,7 +5,10 @@ from contextlib import nullcontext
 import torch
 from tqdm import tqdm
 
-from spectrum_transformer.config import CMS2_NUM_CHANNELS, MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS, SATELLITE_TOKEN_IDS
+from spectrum_transformer.config import (
+    CMS2_INTACT_CHANNELS, CMS2_INTACT_ROW, CMS2_NUM_CHANNELS, MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS,
+    SATELLITE_TOKEN_IDS,
+)
 from spectrum_transformer.training.engine import PEAK_RECALL_BANDS, _cosine_per_sample, _masked_mae_per_sample
 from spectrum_transformer.training.xl_losses import SHORT_CHAIN_MAX_LENGTH, xl_compound_loss
 
@@ -56,7 +59,8 @@ def compute_xl_batch_loss(output, batch, *, empty_peak_weight=0.0, peak_ranking_
 
 
 def xl_density_per_sample(prediction, target, valid_mask):
-    """Return prediction and target density above 0.03 for each complete XL pair."""
+    """Return backbone grid densities using the original 0.03 threshold."""
+    prediction, target, valid_mask = (x[:, :, :CMS2_INTACT_ROW] for x in (prediction, target, valid_mask))
     valid_cells = valid_mask.flatten(1).sum(1).clamp_min(1)
     pred_nz = ((prediction > _DENSITY_THRESHOLD) & valid_mask).flatten(1).sum(1) / valid_cells
     target_nz = ((target > _DENSITY_THRESHOLD) & valid_mask).flatten(1).sum(1) / valid_cells
@@ -65,8 +69,8 @@ def xl_density_per_sample(prediction, target, valid_mask):
 
 def _fragment_peak_counts(peaks, link_sites):
     """Count valid peak cells per sample by fragment state and fragment charge."""
-    by_channel = peaks.sum(dim=3)  # sum tokens, keep chain and cleavage
-    cuts = torch.arange(1, peaks.size(2) + 1, device=peaks.device)
+    by_channel = peaks[:, :, :CMS2_INTACT_ROW].sum(dim=3)  # keep only backbone cleavages
+    cuts = torch.arange(1, by_channel.size(2) + 1, device=peaks.device)
     b_contains_site = cuts >= link_sites.unsqueeze(-1)
     b = by_channel[..., :3].sum(-1)
     y = by_channel[..., 3:6].sum(-1)
@@ -124,10 +128,11 @@ def _intensity_diagnostics(prediction, target, valid, link_sites):
 def _sample_metrics(output, batch, *, peak_presence=False):
     prediction, target, valid = output["prediction"], batch["target"], batch["valid_mask"]
     positive = (target > 0) & valid
-    anchor_mask = valid if peak_presence else batch["main_anchor_mask"]
-    anchor_target = ((target > _DENSITY_THRESHOLD) if peak_presence
-                     else (batch["main_anchor_target"] > 0)) & anchor_mask
-    anchor_prediction = (output["main_anchor_prob"] >= ANCHOR_PROBABILITY_THRESHOLD) & anchor_mask
+    backbone = (slice(None), slice(None), slice(CMS2_INTACT_ROW))
+    anchor_mask = (valid if peak_presence else batch["main_anchor_mask"])[backbone]
+    anchor_target = ((target[backbone] > _DENSITY_THRESHOLD) if peak_presence
+                     else (batch["main_anchor_target"][backbone] > 0)) & anchor_mask
+    anchor_prediction = (output["main_anchor_prob"][backbone] >= ANCHOR_PROBABILITY_THRESHOLD) & anchor_mask
     anchor_tp = (anchor_prediction & anchor_target).flatten(1).sum(1)
     metrics = {
         "cosine": _cosine_per_sample(prediction, target, valid),
@@ -141,6 +146,17 @@ def _sample_metrics(output, batch, *, peak_presence=False):
     }
     intensity_metrics, recall_counts = _intensity_diagnostics(prediction, target, valid, batch.get("link_sites"))
     metrics.update(intensity_metrics)
+    if prediction.size(2) == CMS2_INTACT_ROW + 1:
+        cells = (slice(None), slice(None), CMS2_INTACT_ROW, MAIN_TOKEN_IDS[0], list(CMS2_INTACT_CHANNELS))
+        p, y, mask = (grid[cells] for grid in (prediction, target, valid))
+        metrics["intact_mae"] = _masked_mae_per_sample(p, y, mask)
+        called, observed = (p > _PRESENCE_PREDICTION_THRESHOLD) & mask, (y > _DENSITY_THRESHOLD) & mask
+        hits = (called & observed).sum((1, 2))
+        intact_counts = torch.stack((torch.stack((hits, called.sum((1, 2))), dim=1),
+                                     torch.stack((hits, observed.sum((1, 2))), dim=1)), dim=1)
+        recall_counts = torch.cat((recall_counts, intact_counts), dim=1)
+        prediction, target, valid = prediction[backbone], target[backbone], valid[backbone]
+        metrics["backbone_cosine"] = _cosine_per_sample(prediction, target, valid)
     for name, tokens in _TOKEN_FAMILIES.items():
         family_pred, family_target, family_valid = (x[..., tokens, :] for x in (prediction, target, valid))
         metrics[f"{name}_cosine"] = _cosine_per_sample(family_pred, family_target, family_valid)
@@ -215,6 +231,8 @@ def evaluate_xl(model, loader, device, desc=None, *, peak_presence=False):
         averages["samples"] = len(group)
         averages["zero_positive_samples"] = int(group[:, names.index("zero_positive")].sum())
         recall_names = tuple(name for name, _, _ in PEAK_RECALL_BANDS) + FRAGMENT_RECALL_NAMES
+        if "intact_mae" in averages:
+            recall_names += ("intact_precision", "intact_recall")
         for name, (hits, peaks) in zip(recall_names, counts.sum(dim=0).tolist()):
             averages[name] = hits / peaks if peaks else None
         return averages
