@@ -15,10 +15,6 @@ import pyarrow.csv as csv
 import pyarrow.parquet as pq
 
 
-ROWS = 100_000
-SPECTRA = 2_157
-UNSUPPORTED = 2_035
-SITE_COMBINATIONS = 524_749_627
 MAX_LENGTH = 40
 COLUMNS = {
     "query_id": pa.string(),
@@ -49,11 +45,16 @@ class Forms:
         self.oxidation = np.empty(count, dtype=np.uint64)
         self.cammask = np.empty(count, dtype=np.uint64)
         self.unsupported = np.empty(count, dtype=bool)
+        self.k_counts = np.empty(count, dtype=np.uint8)
+        allowed_sites = []
         allowed_ascii = np.zeros(256, dtype=bool)
         allowed_ascii[[0, *b"ACDEFGHIKLMNPQRSTVWYU"]] = True
         position = np.arange(MAX_LENGTH)
         bit = np.left_shift(np.uint64(1), position.astype(np.uint64))
         columns = ["form_id", "sequence", "length", "oxidation_mask", "modifications", "k_positions_0based"]
+        use_allowed = "allowed_k_positions_0based" in file.schema_arrow.names
+        if use_allowed:
+            columns.append("allowed_k_positions_0based")
 
         offset = 0
         for batch in file.iter_batches(columns=columns, batch_size=65_536):
@@ -108,13 +109,22 @@ class Forms:
                 np.bincount(k_rows, minlength=len(batch)), np.diff(k_offsets)
             ):
                 raise ValueError("K positions disagree with the peptidoform sequence")
+            if use_allowed:
+                allowed = batch["allowed_k_positions_0based"]
+                k_offsets = allowed.offsets.to_numpy()
+                k_positions = allowed.values.slice(int(k_offsets[0]), int(k_offsets[-1] - k_offsets[0])).to_numpy()
+                k_rows = np.repeat(np.arange(len(batch)), np.diff(k_offsets))
+                if ((k_positions < 0).any() or (k_positions >= MAX_LENGTH).any()
+                        or not np.all(aa[k_rows, k_positions] == ord("K"))
+                        or np.any((k_rows[1:] == k_rows[:-1]) & (k_positions[1:] <= k_positions[:-1]))):
+                    raise ValueError("Allowed K positions must be an ordered subset of the peptidoform's K sites")
+            self.k_counts[sl] = np.diff(k_offsets)
+            allowed_sites.append(k_positions.astype(np.uint8) + 1)
             offset = end
 
         if offset != count or np.any(self.ids[1:] <= self.ids[:-1]):
             raise ValueError("Expected strictly increasing, complete peptidoform IDs")
-        _, sites = np.nonzero(self.aa == ord("K"))
-        self.k_sites = sites.astype(np.uint8) + 1
-        self.k_counts = np.count_nonzero(self.aa == ord("K"), axis=1).astype(np.uint8)
+        self.k_sites = np.concatenate(allowed_sites)
         self.k_offsets = np.cumsum(self.k_counts, dtype=np.int64) - self.k_counts
         self.sequence_order = self.aa.view(f"S{MAX_LENGTH}").ravel()
 
@@ -148,15 +158,19 @@ def load_spectra(data):
     truth = {
         gt["query_id"]: gt
         for gt in pq.ParquetFile(test / "ground_truth.parquet").read().to_pylist()
-        if gt["included_in_top100000"]
+        if (gt["candidate_rank"] or 0) > 0
     }
-    # Materializing 2,157 spectra avoids repeatedly decoding row groups.
     columns = ["query_id", "scan_number", "precursor_charge", "precursor_mz", "retention_time_seconds",
-               "mz", "intensity", "crosslinker", "crosslink_mass_da"]
+               "mz", "intensity", "crosslinker", "crosslink_mass_da", "candidate_count"]
     spectra = pq.ParquetFile(test / "spectra.parquet").read(columns=columns).to_pylist()
     selected = [(spec, truth[spec["query_id"]]) for spec in spectra if spec["query_id"] in truth]
-    if len(selected) != SPECTRA or len(truth) != SPECTRA or len({s["query_id"] for s, _ in selected}) != SPECTRA:
-        raise ValueError("Expected 2,157 GT-hit spectra with unique query IDs")
+    if not selected:
+        raise ValueError("No spectra have ground truth in the candidate lists")
+    if len(selected) != len(truth) or len({s["query_id"] for s, _ in selected}) != len(truth):
+        raise ValueError("Expected exactly one spectrum per included ground-truth query")
+    for spec, gt in selected:
+        if spec["candidate_count"] is None or gt["candidate_rank"] > spec["candidate_count"]:
+            raise ValueError(f"Ground-truth rank exceeds the candidate count for {spec['query_id']}")
     return selected
 
 
@@ -167,8 +181,9 @@ def score_spectrum(scorer, forms, spec, gt, candidate_dir, batch_size, *, on_pro
         raise ValueError(f"Unexpected crosslinker for {query}")
     table = pq.ParquetFile(candidate_dir / f"{query}.parquet").read(columns=["rank", "form_a_id", "form_b_id"])
     rank, fa, fb = (table[key].to_numpy() for key in ("rank", "form_a_id", "form_b_id"))
-    if not np.array_equal(rank, np.arange(1, ROWS + 1)):
-        raise ValueError(f"Expected {ROWS} ordered ranks for {query}")
+    row_count = spec["candidate_count"]
+    if not np.array_equal(rank, np.arange(1, row_count + 1)):
+        raise ValueError(f"Expected {row_count} ordered ranks for {query}")
     ga, gb = gt["form_id_a"], gt["form_id_b"]
     is_gt = ((fa == ga) & (fb == gb)) | ((fa == gb) & (fb == ga))
     if is_gt.sum() != 1 or not is_gt[gt["candidate_rank"] - 1]:
@@ -226,14 +241,14 @@ def score_spectrum(scorer, forms, spec, gt, candidate_dir, batch_size, *, on_pro
     best_rows = np.minimum.reduceat(np.where(scores == np.repeat(best, counts), np.arange(len(hyp)), len(hyp)), starts)
     if (best_rows >= len(hyp)).any():
         raise ValueError(f"Could not recover maximizing sites for {query}")
-    cosine = np.full(ROWS, np.nan, dtype=np.float32)
+    cosine = np.full(row_count, np.nan, dtype=np.float32)
     cosine[pairs] = best
-    best_a = np.zeros(ROWS, dtype=np.int8)
-    best_b = np.zeros(ROWS, dtype=np.int8)
+    best_a = np.zeros(row_count, dtype=np.int8)
+    best_b = np.zeros(row_count, dtype=np.int8)
     best_a[pairs], best_b[pairs] = sa[best_rows] - 1, sb[best_rows] - 1
     top = int(np.nanargmax(cosine))
     result = pa.Table.from_arrays([
-        pa.repeat(query, ROWS), pa.array(rank), pa.array(fa), pa.array(fb),
+        pa.repeat(query, row_count), pa.array(rank), pa.array(fa), pa.array(fb),
         pa.array(best_a, mask=unsupported), pa.array(best_b, mask=unsupported),
         pa.array(cosine, mask=unsupported), pa.array(np.where(unsupported, "unsupported_residue", "ok")),
         pa.array(is_gt.astype(np.uint8)),
@@ -245,7 +260,8 @@ def score_spectrum(scorer, forms, spec, gt, candidate_dir, batch_size, *, on_pro
     }
 
 
-def resume_output(stream, query_ids):
+def resume_output(stream, spectra):
+    query_ids = [spec["query_id"] for spec, _ in spectra]
     stream.seek(0, os.SEEK_END)
     end = stream.tell()
     if end == 0:
@@ -279,18 +295,26 @@ def resume_output(stream, query_ids):
     query = last_line[0].decode("ascii")
     ordinal = query_ids.index(query)
     rank = int(last_line[1])
-    if rank == ROWS and last_line[-1] in (b"0", b"1"):
+    row_count = spectra[ordinal][0]["candidate_count"]
+    if not 1 <= rank <= row_count:
+        raise ValueError(f"Existing CSV rank exceeds the candidate count for {query}")
+    if rank == row_count and last_line[-1] in (b"0", b"1"):
         offset = tail_start + last_nl + 1
         completed = ordinal + 1
     else:
         first_row_prefix = f"{query},1,".encode("ascii")
-        if tail_start == len(HEADER) and tail.startswith(first_row_prefix):
-            offset = tail_start
-        else:
-            first = tail.rfind(b"\n" + first_row_prefix, 0, last_nl)
-            if first < 0:
+        marker = b"\n" + first_row_prefix
+        scan_end = tail_start + last_nl
+        while True:
+            scan_start = max(len(HEADER) - 1, scan_end - 16 * 1024 * 1024)
+            stream.seek(scan_start)
+            index = stream.read(scan_end - scan_start).rfind(marker)
+            if index >= 0:
+                offset = scan_start + index + 1
+                break
+            if scan_start == len(HEADER) - 1:
                 raise ValueError("Could not identify the start of an incomplete spectrum block")
-            offset = tail_start + first + 1
+            scan_end = scan_start + len(marker) - 1
         completed = ordinal
     if offset != end:
         stream.truncate(offset)
@@ -299,12 +323,12 @@ def resume_output(stream, query_ids):
     return completed
 
 
-def verify_csv(output, query_ids):
+def verify_csv(output, spectra):
     reader = csv.open_csv(
         output, read_options=csv.ReadOptions(block_size=16 * 1024 * 1024),
         convert_options=csv.ConvertOptions(column_types=COLUMNS),
     )
-    ordinal = position = hit = unsupported = gt_count = 0
+    ordinal = position = hit = unsupported = candidates = 0
     top_score, top_is_gt = -math.inf, False
     for batch in reader:
         ranks = batch["candidate_rank"].to_numpy()
@@ -325,31 +349,35 @@ def verify_csv(output, query_ids):
         unsupported += int(blank.sum())
         start = 0
         while start != len(batch):
-            if ordinal >= len(query_ids):
+            if ordinal >= len(spectra):
                 raise ValueError("CSV has more spectra than expected")
-            length = min(len(batch) - start, ROWS - position)
+            spec, gt = spectra[ordinal]
+            row_count = spec["candidate_count"]
+            length = min(len(batch) - start, row_count - position)
             stop = start + length
             if not np.array_equal(ranks[start:stop], np.arange(position + 1, position + length + 1)):
                 raise ValueError("CSV rank sequence is invalid")
-            if not pc.all(pc.equal(batch["query_id"].slice(start, length), query_ids[ordinal])).as_py():
+            if not pc.all(pc.equal(batch["query_id"].slice(start, length), spec["query_id"])).as_py():
                 raise ValueError("CSV spectrum sequence is invalid")
+            if not np.array_equal(is_gt[start:stop] != 0, ranks[start:stop] == gt["candidate_rank"]):
+                raise ValueError("CSV ground-truth rank does not match the data package")
             slice_scores = np.where(blank[start:stop], -np.inf, scores[start:stop])
             top = int(np.argmax(slice_scores))
             if slice_scores[top] > top_score:
                 top_score, top_is_gt = float(slice_scores[top]), bool(is_gt[start + top])
-            gt_count += int(is_gt[start:stop].sum())
             position += length
             start = stop
-            if position == ROWS:
-                if gt_count != 1 or not math.isfinite(top_score):
-                    raise ValueError("CSV spectrum is missing a valid score or unique Ground Truth")
+            if position == row_count:
+                if not math.isfinite(top_score):
+                    raise ValueError("CSV spectrum is missing a valid score")
                 hit += int(top_is_gt)
                 ordinal += 1
-                position = gt_count = 0
+                candidates += row_count
+                position = 0
                 top_score, top_is_gt = -math.inf, False
-    if position or ordinal != len(query_ids) or (ordinal == SPECTRA and unsupported != UNSUPPORTED):
-        raise ValueError("CSV spectrum or unsupported candidate totals are invalid")
-    return {"spectra": ordinal, "candidates": ordinal * ROWS, "unsupported": unsupported,
+    if position or ordinal != len(spectra):
+        raise ValueError("CSV spectrum or candidate totals are invalid")
+    return {"spectra": ordinal, "candidates": candidates, "unsupported": unsupported,
             "top1_hits": hit, "top1_fraction": hit / ordinal}
 
 
@@ -359,28 +387,24 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--limit-spectra", type=int, default=SPECTRA)
+    parser.add_argument("--limit-spectra", type=int)
     args = parser.parse_args()
-    if args.batch_size < 1 or not 1 <= args.limit_spectra <= SPECTRA:
+    if args.batch_size < 1 or (args.limit_spectra is not None and args.limit_spectra < 1):
         parser.error("Invalid batch size or spectrum limit")
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dataset"))
     from xl_rescore_inference import XLRescoreInference
 
     start = perf_counter()
-    spectra = load_spectra(args.data)
-    query_ids = [spec["query_id"] for spec, _ in spectra]
+    spectra = load_spectra(args.data)[:args.limit_spectra]
     mode = "r+b" if args.output.exists() else "x+b"
-    new_combinations = 0
     with args.output.open(mode) as output:
-        first = resume_output(output, query_ids)
-        if first > args.limit_spectra:
-            raise ValueError("CSV already contains more spectra than the selected limit")
-        if first != args.limit_spectra:
+        first = resume_output(output, spectra)
+        if first != len(spectra):
             forms = Forms(args.data / "peptidoforms.parquet")
             scorer = XLRescoreInference(args.checkpoint, "cuda")
             report("ready", completed=first, seconds=round(perf_counter() - start, 3))
-            for index in range(first, args.limit_spectra):
+            for index in range(first, len(spectra)):
                 time = perf_counter()
                 spec, gt = spectra[index]
                 report("spectrum_started", ordinal=index + 1, query_id=spec["query_id"], scan_number=spec["scan_number"])
@@ -396,11 +420,8 @@ def main():
                     output.flush()
                     output.truncate(committed)
                     raise
-                new_combinations += stats["combinations"]
                 report("spectrum_completed", ordinal=index + 1, seconds=round(perf_counter() - time, 3), **stats)
-    if first == 0 and args.limit_spectra == SPECTRA and new_combinations != SITE_COMBINATIONS:
-        raise ValueError("Site combination count does not match the initial dataset census")
-    report("complete", seconds=round(perf_counter() - start, 3), **verify_csv(args.output, query_ids[:args.limit_spectra]))
+    report("complete", seconds=round(perf_counter() - start, 3), **verify_csv(args.output, spectra))
 
 
 if __name__ == "__main__":
