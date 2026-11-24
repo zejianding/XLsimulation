@@ -4,12 +4,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
+from spectrum_transformer.cli import train_xl
 from spectrum_transformer.config import (
-    CMS2_CHANNEL_NAMES, CMS2_INTACT_CHANNELS, CMS2_INTACT_ROW, MAIN_TOKEN_IDS, SATELLITE_TOKEN_IDS,
+    CMS2_CHANNEL_NAMES, CMS2_INTACT_CHANNELS, CMS2_INTACT_ROW, CMS2_SCHEMA_VERSION, MAIN_TOKEN_IDS, SATELLITE_TOKEN_IDS,
 )
 from spectrum_transformer.data.xl_dataset import AUX_FEATURE_NAMES, XLSpectrumDataset, _record_dtype
 from spectrum_transformer.models.xl_transformer import XLSpectrumTransformer
@@ -22,6 +25,30 @@ from spectrum_transformer.training.xl_losses import (
 class EchoPrediction(torch.nn.Module):
     def forward(self, x, aux_features, **kwargs):
         return {"prediction": x, "main_anchor_prob": torch.zeros_like(x)}
+
+
+class IntactCheckpointTests(unittest.TestCase):
+    def test_five_offset_order_survives_checkpoint_round_trip(self):
+        tokens = (24, 25, 26, 22, 23)
+        dataset = SimpleNamespace(intact_mode=True, intact_token_ids=tokens, schema_version=CMS2_SCHEMA_VERSION,
+                                  metadata={})
+        args = SimpleNamespace(empty_peak_weight=0., peak_ranking_weight=0., seed=42, batch_size=1,
+                               num_workers=0, epochs=0, lr=0.001, weight_decay=0.)
+        with patch.dict(train_xl.MODEL_CONFIG, d_model=16, n_heads=2, n_layers=2, ff_dim=32):
+            model = XLSpectrumTransformer(**train_xl._model_config(dataset))
+            optimizer = torch.optim.AdamW(model.parameters())
+            checkpoint = train_xl._checkpoint(model, optimizer, dataset, args, 0, {})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkpoint.pt"
+            train_xl._save_checkpoint(checkpoint, path)
+            saved = torch.load(path, map_location="cpu", weights_only=True)
+        self.assertEqual(saved["intact_layout"]["offset_token_ids"], tokens)
+        restored = XLSpectrumTransformer.from_cms2_checkpoint(saved)
+        self.assertEqual(restored.intact_token_ids, tokens)
+        self.assertEqual(restored.intact_layout["offset_names"], ("0", "M+1", "M+2", "-H2O", "-NH3"))
+        saved["intact_layout"]["offset_token_ids"] = tuple(sorted(tokens))
+        with self.assertRaisesRegex(ValueError, "intact layout"):
+            XLSpectrumTransformer.from_cms2_checkpoint(saved)
 
 
 class MainTokenRankingTests(unittest.TestCase):
@@ -229,6 +256,8 @@ class CMS2Tests(unittest.TestCase):
         batch["input"][cells] = batch["valid_mask"][cells].float()
         report = evaluate_xl(EchoPrediction(), [batch], torch.device("cpu"))
         self.assertEqual(report["intact_recall"], 1.)
+        self.assertEqual(report["intact_by_offset"]["0"]["mae"], report["intact_mae"])
+        self.assertEqual(report["intact_by_offset"]["M+1"], dict.fromkeys(("mae", "precision", "recall")))
         self.assertEqual(report["backbone_cosine"], 0.)
         self.assertGreater(report["cosine"], 0.)
         self.assertEqual(report["plain_recall"], 0.)
@@ -236,6 +265,48 @@ class CMS2Tests(unittest.TestCase):
         np.save(directory / "train.npy", labels[::-1])
         with self.assertRaisesRegex(ValueError, "group_id"):
             XLSpectrumDataset(self.dataset.dataset_dir, "train", directory)
+
+    def test_only_intact_m_plus_one_predictions_are_wrong(self):
+        directory, _ = self.intact_labels()
+        ds = XLSpectrumDataset(self.dataset.dataset_dir, "train", directory)
+        batch = ds.collate_fn([ds[0], ds[1]])
+        row = CMS2_INTACT_ROW
+        batch["valid_mask"][:, :, row] = False
+        batch["target"][:, :, row] = 0.
+        for token in (24, 25, 26, 22, 23):
+            batch["valid_mask"][:, :, row, token, list(CMS2_INTACT_CHANNELS)] = True
+            batch["target"][0, 0, row, token, 3] = 1.
+            batch["target"][0, 1, row, token, 11] = 1.
+            batch["target"][1, 0, row, token, 4] = 1.
+        batch["input"] = batch["target"].clone()
+        model = EchoPrediction()
+        perfect = evaluate_xl(model, [batch], torch.device("cpu"))
+
+        # For sample 0 only, turn its two M+1 peaks into misses and call one empty cell.
+        batch["input"][0, :, row, 25] = 0.
+        batch["input"][0, 0, row, 25, 9] = 1.
+        changed = evaluate_xl(model, [batch], torch.device("cpu"))
+        self.assertEqual(tuple(changed["intact_by_offset"]), ("0", "M+1", "M+2", "-H2O", "-NH3"))
+        self.assertEqual(perfect["intact_by_offset"]["M+1"], {"mae": 0., "precision": 1., "recall": 1.})
+        self.assertEqual(changed["intact_by_offset"]["M+1"], {"mae": .125, "precision": .5, "recall": 1/3})
+        self.assertAlmostEqual(perfect["intact_cosine"], 1., places=6)
+        self.assertAlmostEqual(changed["intact_cosine"], (8 / np.sqrt(90) + 1) / 2, places=6)
+        for name in ("0", "M+2", "-H2O", "-NH3"):
+            self.assertEqual(changed["intact_by_offset"][name], perfect["intact_by_offset"][name])
+        for name in ("intact_mae", "intact_precision", "intact_recall", "backbone_cosine",
+                     "anchor_precision", "anchor_recall", "pred_nonzero_ratio", "target_nonzero_ratio",
+                     "density_gap", *FRAGMENT_RECALL_NAMES):
+            self.assertEqual(changed[name], perfect[name], name)
+        for family in ("main", "satellite", "residue_event"):
+            for metric in ("cosine", "masked_mae"):
+                self.assertEqual(changed[f"{family}_{metric}"], perfect[f"{family}_{metric}"])
+        self.assertEqual(changed["by_charge"]["7"], perfect["by_charge"]["7"])
+        self.assertEqual(changed["by_charge"]["4"]["intact_by_offset"]["M+1"],
+                         {"mae": .25, "precision": 0., "recall": 0.})
+        split_batches = [{key: value[i:i+1] for key, value in batch.items()} for i in range(2)]
+        split_report = evaluate_xl(model, split_batches, torch.device("cpu"))
+        self.assertEqual(split_report["intact_by_offset"], changed["intact_by_offset"])
+        self.assertEqual(split_report["intact_cosine"], changed["intact_cosine"])
 
     def test_intact_uses_main_head_and_preserves_backbone_when_masked(self):
         directory, _ = self.intact_labels()

@@ -6,7 +6,7 @@ import torch
 from tqdm import tqdm
 
 from spectrum_transformer.config import (
-    CMS2_INTACT_CHANNELS, CMS2_INTACT_ROW, CMS2_NUM_CHANNELS, MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS,
+    CMS2_INTACT_CHANNELS, CMS2_INTACT_OFFSET_TOKENS, CMS2_INTACT_ROW, CMS2_NUM_CHANNELS, MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS,
     SATELLITE_TOKEN_IDS,
 )
 from spectrum_transformer.training.engine import PEAK_RECALL_BANDS, _cosine_per_sample, _masked_mae_per_sample
@@ -125,6 +125,37 @@ def _intensity_diagnostics(prediction, target, valid, link_sites):
     return metrics, counts
 
 
+def _intact_metrics(prediction, target, valid):
+    tokens = list(CMS2_INTACT_OFFSET_TOKENS.values())
+    # (sample, offset, chain x stub x charge) for the intact row only.
+    p, y, mask = (
+        grid[:, :, CMS2_INTACT_ROW, tokens, :][..., CMS2_INTACT_CHANNELS].transpose(1, 2).flatten(2)
+        for grid in (prediction, target, valid)
+    )
+    called = (p > _PRESENCE_PREDICTION_THRESHOLD) & mask
+    observed = (y > _DENSITY_THRESHOLD) & mask
+    valid_cells = mask.sum(-1)
+    mae = ((p - y).abs() * mask).sum(-1) / valid_cells.clamp_min(1)
+    counts = torch.stack((valid_cells, (called & observed).sum(-1), called.sum(-1), observed.sum(-1)), dim=-1)
+    return _cosine_per_sample(p, y, mask), mae, counts
+
+
+def _summarize_intact(mae, counts):
+    # As in the original zero-offset report, average MAE by spectrum and pool peak counts.
+    mean_mae = mae.mean(dim=0).tolist()
+    by_offset = {}
+    for name, error, (valid_cells, hits, called, observed) in zip(
+        CMS2_INTACT_OFFSET_TOKENS, mean_mae, counts.sum(dim=0).tolist()
+    ):
+        by_offset[name] = {
+            "mae": error if valid_cells else None,
+            "precision": hits / called if called else None,
+            "recall": hits / observed if observed else None,
+        }
+    return {"intact_by_offset": by_offset, "intact_mae": mean_mae[0],
+            "intact_precision": by_offset["0"]["precision"], "intact_recall": by_offset["0"]["recall"]}
+
+
 def _sample_metrics(output, batch, *, peak_presence=False):
     prediction, target, valid = output["prediction"], batch["target"], batch["valid_mask"]
     positive = (target > 0) & valid
@@ -147,14 +178,6 @@ def _sample_metrics(output, batch, *, peak_presence=False):
     intensity_metrics, recall_counts = _intensity_diagnostics(prediction, target, valid, batch.get("link_sites"))
     metrics.update(intensity_metrics)
     if prediction.size(2) == CMS2_INTACT_ROW + 1:
-        cells = (slice(None), slice(None), CMS2_INTACT_ROW, MAIN_TOKEN_IDS[0], list(CMS2_INTACT_CHANNELS))
-        p, y, mask = (grid[cells] for grid in (prediction, target, valid))
-        metrics["intact_mae"] = _masked_mae_per_sample(p, y, mask)
-        called, observed = (p > _PRESENCE_PREDICTION_THRESHOLD) & mask, (y > _DENSITY_THRESHOLD) & mask
-        hits = (called & observed).sum((1, 2))
-        intact_counts = torch.stack((torch.stack((hits, called.sum((1, 2))), dim=1),
-                                     torch.stack((hits, observed.sum((1, 2))), dim=1)), dim=1)
-        recall_counts = torch.cat((recall_counts, intact_counts), dim=1)
         prediction, target, valid = prediction[backbone], target[backbone], valid[backbone]
         metrics["backbone_cosine"] = _cosine_per_sample(prediction, target, valid)
     for name, tokens in _TOKEN_FAMILIES.items():
@@ -185,6 +208,7 @@ def evaluate_xl(model, loader, device, desc=None, *, peak_presence=False):
     model.eval()
     charge_batches, metric_batches, chain_batches, short_batches = [], [], [], []
     recall_batches = []
+    intact_mae_batches, intact_count_batches = [], []
     running_cosine = running_mae = 0.0
     evaluated = 0
     iterator = (
@@ -197,6 +221,12 @@ def evaluate_xl(model, loader, device, desc=None, *, peak_presence=False):
             batch = prepare_xl_batch(batch, device)
             output = predict_xl_batch(model, batch)
             metrics, recall_counts = _sample_metrics(output, batch, peak_presence=peak_presence)
+            if batch["target"].size(2) == CMS2_INTACT_ROW + 1:
+                metrics["intact_cosine"], offset_mae, offset_counts = _intact_metrics(
+                    output["prediction"], batch["target"], batch["valid_mask"]
+                )
+                intact_mae_batches.append(offset_mae.cpu())
+                intact_count_batches.append(offset_counts.cpu())
             names = tuple(metrics)
             rows = torch.stack(tuple(metrics.values()), dim=1).cpu()
             charge_batches.append(batch["precursor_charge"].cpu())
@@ -224,24 +254,28 @@ def evaluate_xl(model, loader, device, desc=None, *, peak_presence=False):
     charge_values = charges.unique().tolist()
     rows = torch.cat(metric_batches)
     recall_counts = torch.cat(recall_batches)
+    if intact_mae_batches:
+        intact_mae = torch.cat(intact_mae_batches)
+        intact_counts = torch.cat(intact_count_batches)
 
-    def summarize(group, counts):
+    def summarize(selected):
+        group, counts = rows[selected], recall_counts[selected]
         averages = dict(zip(names, group.mean(dim=0).tolist()))
         del averages["zero_positive"]
         averages["samples"] = len(group)
         averages["zero_positive_samples"] = int(group[:, names.index("zero_positive")].sum())
         recall_names = tuple(name for name, _, _ in PEAK_RECALL_BANDS) + FRAGMENT_RECALL_NAMES
-        if "intact_mae" in averages:
-            recall_names += ("intact_precision", "intact_recall")
         for name, (hits, peaks) in zip(recall_names, counts.sum(dim=0).tolist()):
             averages[name] = hits / peaks if peaks else None
+        if intact_mae_batches:
+            averages.update(_summarize_intact(intact_mae[selected], intact_counts[selected]))
         return averages
 
-    report = summarize(rows, recall_counts)
+    report = summarize(slice(None))
     report["by_charge"] = {}
     for charge in charge_values:
         selected = charges == charge
-        report["by_charge"][str(charge)] = summarize(rows[selected], recall_counts[selected])
+        report["by_charge"][str(charge)] = summarize(selected)
     report["by_chain_length"] = _chain_length_metrics(
         torch.cat(chain_batches), torch.cat(short_batches), charges.repeat_interleave(2), charge_values
     )

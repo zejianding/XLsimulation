@@ -5,7 +5,11 @@ An XL NPZ can contain the structured array as ``records`` or store its fields
 as separate arrays. The required fields are ``input_theo_mz``, ``sequence``,
 ``lengths``, ``link_sites`` (1-based), ``precursor_charge``, ``precursor_mz``,
 and ``rt_seconds``. Optional MGF metadata comes from ``group_id``,
-``crosslinker``, and ``linker_mass``.
+``crosslinker``, and ``linker_mass``. Twelve-channel cMS2 inputs require
+``crosslinker``. For intact checkpoints, the extra row is calculated from
+the two sequences and the checkpoint's short/long stub masses. In cluster
+mode, backbone channels are processed in six-channel blocks and intact peaks
+above ``--raw_min_intensity`` are included in the final m/z merge.
 """
 
 from __future__ import annotations
@@ -37,11 +41,14 @@ from cluster_postprocess import (
     summarize_diagnostics,
 )
 from predict_mgf import prediction_to_mgf_peaks
-from spectrum_transformer.config import CHANNEL_NAMES, MAX_CLEAVAGE_LEN
+from spectrum_transformer.config import (
+    CHANNEL_NAMES, CMS2_NUM_CHANNELS, CMS2_SCHEMA_VERSION, DEFAULT_MIN_VALID_MZ, MAX_CLEAVAGE_LEN,
+)
 from spectrum_transformer.data.xl_dataset import XLInputCollator
 from spectrum_transformer.models.xl_transformer import XLSpectrumTransformer
 from spectrum_transformer.training.xl_engine import predict_xl_batch
 from spectrum_transformer.warnings import configure_v20_warning_filters
+from token_table import CHARGE_TOKENS, H2O, PROTON
 
 configure_v20_warning_filters()
 
@@ -216,8 +223,11 @@ def load_model(checkpoint_path: str | Path, device: torch.device):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if ckpt.get("model_type") == "xl_spectrum_transformer":
         model_config = ckpt["model_config"]
-        model = XLSpectrumTransformer(**model_config)
-        model.load_state_dict(ckpt["model_state_dict"])
+        if ckpt.get("data_schema_version") == CMS2_SCHEMA_VERSION:
+            model = XLSpectrumTransformer.from_cms2_checkpoint(ckpt)
+        else:
+            model = XLSpectrumTransformer(**model_config)
+            model.load_state_dict(ckpt["model_state_dict"])
         return model.to(device).eval(), ckpt, model_config
 
     model_config, state_dict = prepare_checkpoint_for_inference(ckpt)
@@ -318,6 +328,25 @@ def collate_prediction_batch(batch: list[dict]) -> dict:
     }
 
 
+def _cms2_intact_theory(rows, stub_masses, token_ids):
+    """Return training-layout m/z and masks for chain × stub × charge (× offset)."""
+    charges = np.arange(1, 4)
+    offsets = np.array([[CHARGE_TOKENS[z][token] for token in token_ids] for z in charges])
+    mz = np.empty((len(rows), 2, 2, len(charges), len(token_ids)), dtype=np.float64)
+    for index, row in enumerate(rows):
+        chains = (parse_sequence_with_mods(_xl_text(seq)) for seq in row["sequence"])
+        masses = np.array([sum(m for _, m in residues) + nterm + H2O for residues, nterm in chains])
+        stubs = np.asarray(stub_masses[_xl_text(row["crosslinker"])])
+        base = (masses[:, None, None] + stubs[:, None] + charges * PROTON) / charges
+        mz[index] = base[..., None] + offsets
+    precursor_charges = np.array([row["precursor_charge"] for row in rows])
+    allowed = charges <= precursor_charges[:, None]
+    valid = (mz >= DEFAULT_MIN_VALID_MZ) & allowed[:, None, None, :, None]
+    if len(token_ids) == 1:  # The zero-offset collator layout omits the offset axis.
+        mz, valid = mz[..., 0], valid[..., 0]
+    return {"mz": np.where(valid, mz, 0.0), "valid_mask": valid}
+
+
 class XLPredictionDataset(Dataset):
     """Read paired inference fields while keeping structured NPY inputs memory-mapped."""
 
@@ -331,7 +360,7 @@ class XLPredictionDataset(Dataset):
     }
     _OPTIONAL_FIELDS = ("group_id", "crosslinker", "linker_mass")
 
-    def __init__(self, path, split, metadata):
+    def __init__(self, path, split, metadata, intact_token_ids=()):
         self.path = Path(path)
         if self.path.is_dir():
             self.path = self.path / f"{split}.npy"
@@ -344,11 +373,18 @@ class XLPredictionDataset(Dataset):
         grid = self._columns["input_theo_mz"]
         base_shape = (2, MAX_CLEAVAGE_LEN, len(CHANNEL_NAMES))
         expanded_shape = (2, MAX_CLEAVAGE_LEN, NUM_TOKENS, len(CHANNEL_NAMES))
-        schema_by_shape = {base_shape: 1, expanded_shape: 2}
+        cms2_shape = (2, MAX_CLEAVAGE_LEN, NUM_TOKENS, CMS2_NUM_CHANNELS)
+        schema_by_shape = {base_shape: 1, expanded_shape: 2, cms2_shape: CMS2_SCHEMA_VERSION}
         schema_version = schema_by_shape.get(grid.shape[1:])
         if schema_version is None or grid.dtype.kind != "f":
             raise ValueError(f"XL input_theo_mz must have floating-point grids shaped "
-                             f"{expanded_shape} or {base_shape}, got {grid.shape} with dtype {grid.dtype}")
+                             f"{cms2_shape}, {expanded_shape} or {base_shape}, got {grid.shape} with dtype {grid.dtype}")
+        if (schema_version == CMS2_SCHEMA_VERSION) != (metadata.get("schema_version") == CMS2_SCHEMA_VERSION):
+            raise ValueError("Input channel count does not match the XL checkpoint")
+        if schema_version == CMS2_SCHEMA_VERSION and "crosslinker" not in self._columns:
+            raise ValueError("cMS2 input requires the crosslinker field (DSSO or DSBU)")
+        self.intact_token_ids = intact_token_ids
+        self.stub_masses = metadata["stub_masses_da"] if intact_token_ids else None
 
         self.count = len(grid)
         optional = [name for name in self._OPTIONAL_FIELDS if name in self._columns]
@@ -395,7 +431,8 @@ class XLPredictionDataset(Dataset):
         return {name: self._columns[name][index] for name in self.fields}
 
     def collate_fn(self, rows):
-        batch = self.input_collator(rows)
+        intact = _cms2_intact_theory(rows, self.stub_masses, self.intact_token_ids) if self.intact_token_ids else None
+        batch = self.input_collator(rows, intact)
         metadata = [{name: row[name] for name in self.fields if name != "input_theo_mz"} for row in rows]
         return batch, metadata
 
@@ -557,38 +594,58 @@ def write_mgf_block(
     fout.write("END IONS\n\n")
 
 
+def _xl_raw_cells(prediction, mz, valid, intensity_floor):
+    selected = valid & (prediction > intensity_floor)
+    return [{"mz": mass, "intensity": intensity}
+            for mass, intensity in zip(mz[selected], prediction[selected])]
+
+
 def _xl_spectrum_peaks(prediction, mz, valid, sequences, lengths, link_sites, charge, *,
                        postprocess_mode, raw_min_intensity, merge_tol, scene, params, n_true_mean):
     if postprocess_mode == "none":
-        selected = valid & (prediction > raw_min_intensity)
-        cells = [{"mz": mass, "intensity": intensity}
-                 for mass, intensity in zip(mz[selected], prediction[selected])]
+        cells = _xl_raw_cells(prediction, mz, valid, raw_min_intensity)
         return merge_overlapping_peaks(cells, merge_tol), len(cells), []
 
     residues, nterm_shifts = zip(*(parse_sequence_with_mods(seq) for seq in sequences))
     masked_prediction = np.where(valid, prediction, 0.0)
-    chain_peaks = []
+    is_cms2 = prediction.shape[-1] == CMS2_NUM_CHANNELS
+    if is_cms2:
+        mz = np.where(valid, mz, 0.0)
+    # The last row is an intact ion, so cleavage-position clustering does not apply.
+    intact_valid = valid[:, MAX_CLEAVAGE_LEN:]
+    if intact_valid.size and params.get("export_tokens") is not None:
+        keep = np.isin(np.arange(NUM_TOKENS), params["export_tokens"])
+        intact_valid = intact_valid & keep[:, None]
+    chain_peaks = _xl_raw_cells(prediction[:, MAX_CLEAVAGE_LEN:], mz[:, MAX_CLEAVAGE_LEN:],
+                                intact_valid, raw_min_intensity)
     diagnostics = []
-    candidate_slots = 0
+    candidate_slots = len(chain_peaks)
+    channel_width = len(CHANNEL_NAMES)
     for chain, chain_name in enumerate(("A", "B")):
-        cells, diagnostic = run_cluster_postprocess(
-            pred_matrix=masked_prediction[chain],
-            input_mz=mz[chain],
-            peptide_length=lengths[chain],
-            precursor_charge=charge,
-            scene=scene,
-            params=params,
-            n_true_mean=n_true_mean,
-            residues=residues[chain],
-            nterm_shift=nterm_shifts[chain],
-            link_site=link_sites[chain],
-            partner_residues=residues[1 - chain],
-        )
-        peaks = merge_overlapping_peaks(cells, merge_tol)
-        chain_peaks.extend(apply_postmerge_expression_calibration(peaks, charge, lengths[chain], scene, params))
-        candidate_slots += len(cells)
-        diagnostics.append({**diagnostic, "chain": chain_name, "seq": sequences[chain],
-                            "link_site": link_sites[chain], "chain_peaks": len(peaks)})
+        for start in range(0, prediction.shape[-1], channel_width):
+            block = (chain, slice(0, MAX_CLEAVAGE_LEN), slice(None), slice(start, start + channel_width))
+            cells, diagnostic = run_cluster_postprocess(
+                pred_matrix=masked_prediction[block],
+                input_mz=mz[block],
+                peptide_length=lengths[chain],
+                precursor_charge=charge,
+                scene=scene,
+                params=params,
+                n_true_mean=n_true_mean,
+                residues=residues[chain],
+                nterm_shift=nterm_shifts[chain],
+                link_site=link_sites[chain],
+                # A cleaved stub carries no residues from the other chain.
+                partner_residues=() if is_cms2 else residues[1 - chain],
+            )
+            if is_cms2:
+                cells = [cell for cell in cells if cell["mz"] > 0]
+                diagnostic["channel_group"] = "plain_or_short" if start == 0 else "long"
+            peaks = merge_overlapping_peaks(cells, merge_tol)
+            chain_peaks.extend(apply_postmerge_expression_calibration(peaks, charge, lengths[chain], scene, params))
+            candidate_slots += len(cells)
+            diagnostics.append({**diagnostic, "chain": chain_name, "seq": sequences[chain],
+                                "link_site": link_sites[chain], "chain_peaks": len(peaks)})
     return merge_overlapping_peaks(chain_peaks, merge_tol), candidate_slots, diagnostics
 
 
@@ -615,7 +672,7 @@ def _export_xl(model, checkpoint, checkpoint_metadata, npz_path, output_mgf, *, 
                postprocess_mode, scene, params, n_true_mean, cluster_diag_dir):
     if max_examples is not None and max_examples < 0:
         raise ValueError("--max_examples must be nonnegative")
-    dataset = XLPredictionDataset(npz_path, split, checkpoint_metadata)
+    dataset = XLPredictionDataset(npz_path, split, checkpoint_metadata, model.intact_token_ids)
     count = len(dataset) if max_examples is None else min(max_examples, len(dataset))
     loader = DataLoader(
         Subset(dataset, range(count)), batch_size=batch_size, num_workers=num_workers,
@@ -1275,7 +1332,7 @@ def main() -> None:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--min_mz", type=float, default=100.0, help="Minimum m/z for exported peaks")
     parser.add_argument("--raw_min_intensity", type=float, default=0.01,
-                        help="grid->peak intensity floor for --postprocess_mode none")
+                        help="intensity floor for raw export and for intact cMS2 peaks in cluster mode")
     parser.add_argument("--merge_tol", type=float, default=0.05, help="m/z merge tolerance (Da)")
     parser.add_argument(
         "--postprocess_mode",

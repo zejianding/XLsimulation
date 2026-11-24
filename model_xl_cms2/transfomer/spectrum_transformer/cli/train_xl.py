@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from spectrum_transformer.config import (
-    AUX_FEATURE_DIM, CMS2_CHANNEL_NAMES, CMS2_INTACT_LAYOUT, CMS2_INTACT_ROW,
+    AUX_FEATURE_DIM, CMS2_CHANNEL_NAMES, CMS2_INTACT_ROW,
     CMS2_LINKER_IDS, CMS2_NUM_CHANNELS, CMS2_SCHEMA_VERSION,
     DEFAULT_D_MODEL, DEFAULT_DROPOUT, DEFAULT_EPOCHS, DEFAULT_FF_DIM, DEFAULT_LR,
     DEFAULT_N_HEADS, DEFAULT_N_LAYERS, DEFAULT_SEED, DEFAULT_SEQUENCE_CONTEXT_DIM, DEFAULT_WEIGHT_DECAY,
@@ -86,7 +86,13 @@ def _selection_metric(args):
     )
 
 
+def _model_config(dataset):
+    return {**MODEL_CONFIG, "intact_mode": dataset.intact_mode, "intact_token_ids": dataset.intact_token_ids}
+
+
 def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
+    if model.intact_token_ids != dataset.intact_token_ids:
+        raise ValueError("Model and dataset intact token orders differ")
     loss_config = {"weights": XL_LOSS_WEIGHTS, "shared_main_peak_weight": 1.0,
                    "main_peak_threshold": MAIN_PEAK_THRESHOLD, "short_chain_max_length": SHORT_CHAIN_MAX_LENGTH,
                    "short_chain_scope": "per_chain", "empty_peak_weight": args.empty_peak_weight}
@@ -127,7 +133,7 @@ def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
         }
     checkpoint = {
         "model_type": "xl_spectrum_transformer",
-        "model_config": {**MODEL_CONFIG, "intact_mode": model.intact_mode},
+        "model_config": _model_config(dataset),
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
@@ -148,7 +154,7 @@ def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
                      "epochs": args.epochs, "optimizer": "AdamW", "lr": args.lr, "weight_decay": args.weight_decay},
     }
     if model.intact_mode:
-        checkpoint["intact_layout"] = CMS2_INTACT_LAYOUT
+        checkpoint["intact_layout"] = dict(model.intact_layout)
     return checkpoint
 
 
@@ -267,7 +273,8 @@ def _smoke(model, optimizer, dataset, args, device):
     if model.intact_mode:
         report["intact_valid_cells"] = int(batch["valid_mask"][:, :, CMS2_INTACT_ROW].sum())
         report["post_step_intact"] = {key: metrics[key] for key in
-                                      ("backbone_cosine", "intact_mae", "intact_precision", "intact_recall")}
+                                      ("backbone_cosine", "intact_mae", "intact_precision", "intact_recall",
+                                       "intact_cosine", "intact_by_offset")}
     if getattr(args, "peak_presence", False):
         report["peak_selection"] = metrics["peak_selection"]
     print(json.dumps(report, indent=2, allow_nan=False), flush=True)
@@ -435,7 +442,7 @@ def _train_steps(model, optimizer, train_data, args, device):
         log("config", lr=args.lr, max_steps=args.max_steps, seed=args.seed, batch_size=args.batch_size,
             num_workers=args.num_workers, weight_decay=args.weight_decay, optimizer="AdamW",
             device=str(device), dataset_dir=str(args.dataset_dir.resolve()),
-            model_config={**MODEL_CONFIG, "intact_mode": model.intact_mode},
+            model_config=_model_config(train_data),
             loss_weights=XL_LOSS_WEIGHTS, empty_peak_weight=args.empty_peak_weight,
             peak_ranking_weight=args.peak_ranking_weight,
             peak_presence=getattr(args, "peak_presence", False),
@@ -651,7 +658,7 @@ def main():
         raise ValueError("cMS2 training requires a twelve-channel v4 dataset.")
     if len(dataset) == 0:
         raise ValueError("The XL training split is empty")
-    model = XLSpectrumTransformer(**MODEL_CONFIG, intact_mode=dataset.intact_mode).to(device)
+    model = XLSpectrumTransformer(**_model_config(dataset)).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if args.smoke:
         _smoke(model, optimizer, dataset, args, device)

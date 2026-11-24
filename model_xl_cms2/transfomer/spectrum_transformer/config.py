@@ -39,12 +39,24 @@ CMS2_CHANNEL_NAMES = tuple(f"{state}_{ion}" for state in ("plain_or_short", "lon
 CMS2_NUM_CHANNELS = len(CMS2_CHANNEL_NAMES)
 CMS2_FRAGMENT_CHARGES = (1, 2, 3, 1, 2, 3) * 2
 CMS2_LINKER_IDS = {"DSSO": 0, "DSBU": 1}
-# The optional last row represents the intact chain, at zero mass offset.
+# The optional last row represents the intact chain at the offsets enabled by its labels.
 CMS2_INTACT_ROW = MAX_CLEAVAGE_LEN
 CMS2_INTACT_CHANNELS = (3, 4, 5, 9, 10, 11)  # short 1+/2+/3+, then long 1+/2+/3+
-CMS2_INTACT_LAYOUT = {
-    "row": CMS2_INTACT_ROW, "token": MAIN_TOKEN_IDS[0], "channels": CMS2_INTACT_CHANNELS,
-    "states": ("short", "long"), "charges": (1, 2, 3), "head": "main_head",
+CMS2_INTACT_OFFSET_TOKENS = {"0": MAIN_TOKEN_IDS[0], "M+1": 25, "M+2": 26, "-H2O": 22, "-NH3": 23}
+_INTACT_AXES = {
+    "row": CMS2_INTACT_ROW, "channels": CMS2_INTACT_CHANNELS,
+    "states": ("short", "long"), "charges": (1, 2, 3),
+}
+# Preserve the on-disk layout of existing zero-offset checkpoints (including 122606).
+CMS2_INTACT_LAYOUT = {**_INTACT_AXES, "token": MAIN_TOKEN_IDS[0], "head": "main_head"}
+CMS2_INTACT_LAYOUTS = {
+    MAIN_TOKEN_IDS: CMS2_INTACT_LAYOUT,
+    tuple(CMS2_INTACT_OFFSET_TOKENS.values()): {
+        **_INTACT_AXES, "offset_names": tuple(CMS2_INTACT_OFFSET_TOKENS),
+        "offset_token_ids": tuple(CMS2_INTACT_OFFSET_TOKENS.values()),
+        "heads": tuple("main_head" if t in MAIN_TOKEN_IDS else "satellite_head"
+                       for t in CMS2_INTACT_OFFSET_TOKENS.values()),
+    },
 }
 
 TOKEN_FAMILY_NAMES = ("residue_event", "satellite", "main")

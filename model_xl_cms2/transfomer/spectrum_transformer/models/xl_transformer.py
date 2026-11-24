@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from spectrum_transformer.config import (
     AUX_FEATURE_DIM,
     CMS2_CHANNEL_NAMES,
-    CMS2_INTACT_LAYOUT,
+    CMS2_INTACT_LAYOUTS,
     CMS2_INTACT_ROW,
     CMS2_LINKER_IDS,
     CMS2_NUM_CHANNELS,
@@ -45,6 +45,7 @@ class XLSpectrumTransformer(nn.Module):
         aux_dim=AUX_FEATURE_DIM,
         sequence_context_dim=DEFAULT_SEQUENCE_CONTEXT_DIM,
         intact_mode=False,
+        intact_token_ids=None,
     ):
         super().__init__()
         if (in_channels, out_channels) not in ((CMS2_NUM_CHANNELS, CMS2_NUM_CHANNELS),
@@ -57,6 +58,13 @@ class XLSpectrumTransformer(nn.Module):
         if intact_mode and in_channels != CMS2_NUM_CHANNELS:
             raise ValueError("The intact row requires a twelve-channel cMS2 model")
         self.intact_mode = intact_mode
+        if intact_token_ids is None:
+            intact_token_ids = MAIN_TOKEN_IDS if intact_mode else ()
+        self.intact_token_ids = tuple(intact_token_ids)
+        if (bool(self.intact_token_ids) != intact_mode
+                or (intact_mode and self.intact_token_ids not in CMS2_INTACT_LAYOUTS)):
+            raise ValueError(f"Incompatible cMS2 intact mode and token order: {intact_mode}, {self.intact_token_ids}")
+        self.intact_layout = dict(CMS2_INTACT_LAYOUTS[self.intact_token_ids]) if intact_mode else None
 
         self.input_proj = nn.Linear(in_channels, d_model)
         self.aux_proj = nn.Linear(aux_dim, d_model)
@@ -113,9 +121,9 @@ class XLSpectrumTransformer(nn.Module):
                 or checkpoint.get("linker_ids") != CMS2_LINKER_IDS
                 or (config["in_channels"], config["out_channels"]) != (CMS2_NUM_CHANNELS, CMS2_NUM_CHANNELS)):
             raise ValueError("Incompatible cMS2 checkpoint schema, fragment channels or linker IDs.")
-        if config.get("intact_mode", False) and checkpoint.get("intact_layout") != CMS2_INTACT_LAYOUT:
-            raise ValueError("Incompatible cMS2 checkpoint intact layout")
         model = cls(**config)
+        if checkpoint.get("intact_layout") != model.intact_layout:
+            raise ValueError("Incompatible cMS2 checkpoint intact layout")
         model.load_state_dict(checkpoint["model_state_dict"])
         return model.eval()
 

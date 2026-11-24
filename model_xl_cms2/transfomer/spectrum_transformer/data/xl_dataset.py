@@ -11,7 +11,8 @@ import torch
 from torch.utils.data import Dataset
 
 from ..config import (
-    CHANNEL_NAMES, CMS2_CHANNEL_NAMES, CMS2_FRAGMENT_CHARGES, CMS2_INTACT_CHANNELS, CMS2_INTACT_ROW,
+    CHANNEL_NAMES, CMS2_CHANNEL_NAMES, CMS2_FRAGMENT_CHARGES, CMS2_INTACT_CHANNELS, CMS2_INTACT_OFFSET_TOKENS,
+    CMS2_INTACT_ROW,
     CMS2_LINKER_IDS, CMS2_NUM_CHANNELS,
     CMS2_SCHEMA_VERSION, DEFAULT_MIN_VALID_MZ, MAIN_TOKEN_IDS, MAX_CLEAVAGE_LEN, MAX_PEPTIDE_LEN, NUM_TOKENS,
 )
@@ -71,23 +72,34 @@ def _record_dtype(widths, input_shape, target_shape):
 
 
 def _append_intact_row(grid, values):
-    # Both arrays use the canonical v4 chain order; flatten only (stub, charge).
+    # Version 1 has no offset axis. Both versions flatten only (stub, charge) into channels.
+    tokens = MAIN_TOKEN_IDS if values.ndim == 4 else tuple(CMS2_INTACT_OFFSET_TOKENS.values())
+    by_channel = values.reshape(*grid.shape[:2], len(CMS2_INTACT_CHANNELS), len(tokens))
     row = np.zeros((*grid.shape[:2], 1, *grid.shape[3:]), dtype=grid.dtype)
-    row[:, :, 0, _MAIN_TOKEN, :][..., CMS2_INTACT_CHANNELS] = values.reshape(*grid.shape[:2], 6)
+    for offset, token in enumerate(tokens):
+        row[:, :, 0, token, :][..., CMS2_INTACT_CHANNELS] = by_channel[..., offset]
     return np.concatenate((grid, row), axis=2)
 
 
 def _load_intact_labels(directory, split, records):
     directory = Path(directory)
     manifest = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    version = manifest.get("label_schema_version")
     axes = [["alpha (v4 sequence[0])", "beta (v4 sequence[1])"], ["short", "long"], [1, 2, 3]]
-    if (manifest.get("label_type") != "intact_peptide_stub" or manifest.get("label_schema_version") != 1
+    shape = (2, 2, 3)
+    if version == 2:
+        axes.append(list(CMS2_INTACT_OFFSET_TOKENS))
+        shape += (len(CMS2_INTACT_OFFSET_TOKENS),)
+        if (manifest.get("axis_order") != ["chain", "stub", "fragment_charge", "mass_offset"]
+                or manifest.get("offset_token_ids") != list(CMS2_INTACT_OFFSET_TOKENS.values())):
+            raise ValueError("Unexpected five-offset intact label axes or token IDs")
+    if (manifest.get("label_type") != "intact_peptide_stub" or version not in (1, 2)
             or manifest.get("axis_values") != axes or manifest.get("target_normalization") != "sqrt_clip"
             or manifest.get("clip_intensity") != 50000):
         raise ValueError("Incompatible intact label schema, axis order or intensity scale")
     labels = np.load(directory / f"{split}.npy", allow_pickle=False)
-    dtype = np.dtype([("group_id", "S64"), ("mz", "<f8", (2, 2, 3)),
-                      ("target", "<f4", (2, 2, 3)), ("valid_mask", "?", (2, 2, 3))])
+    dtype = np.dtype([("group_id", "S64"), ("mz", "<f8", shape),
+                      ("target", "<f4", shape), ("valid_mask", "?", shape)])
     if labels.dtype != dtype or labels.shape != records.shape:
         raise ValueError(f"{split}: intact label dtype or row count differs from the expected layout")
     ids = labels["group_id"]
@@ -95,11 +107,13 @@ def _load_intact_labels(directory, split, records):
         raise ValueError(f"{split}: intact group_id values must be unique and in v4 row order")
     mz, target, valid = labels["mz"], labels["target"], labels["valid_mask"]
     allowed_charge = np.arange(1, 4) <= records["precursor_charge"][:, None, None, None]
+    if version == 2:
+        allowed_charge = allowed_charge[..., None]
     if (not np.isfinite(mz).all() or not np.array_equal(valid, (mz >= DEFAULT_MIN_VALID_MZ) & allowed_charge)
             or not np.isfinite(target).all() or ((target < 0) | (target > 1)).any()
             or mz[~valid].any() or target[~valid].any()):
         raise ValueError(f"{split}: invalid intact m/z, target or mask")
-    return labels
+    return labels, tuple(manifest["offset_token_ids"]) if version == 2 else MAIN_TOKEN_IDS
 
 
 def _normalization_stats(metadata, key, width):
@@ -273,10 +287,11 @@ class XLSpectrumDataset(Dataset):
         self._count = len(records)
         self._records = records
         self.intact_mode = intact_labels_dir is not None
+        self.intact_token_ids = ()
         if self.intact_mode:
             if not is_cms2:
                 raise ValueError("Intact labels require a cMS2 v4 dataset")
-            self._intact_labels = _load_intact_labels(intact_labels_dir, split, records)
+            self._intact_labels, self.intact_token_ids = _load_intact_labels(intact_labels_dir, split, records)
             self._intact_indices = {gid: i for i, gid in enumerate(self._intact_labels["group_id"])}
 
     def __getstate__(self):
