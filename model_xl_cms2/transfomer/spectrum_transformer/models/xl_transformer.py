@@ -8,12 +8,12 @@ from torch.nn import functional as F
 
 from spectrum_transformer.config import (
     AUX_FEATURE_DIM,
-    CMS2_CHANNEL_NAMES,
+    CMS2_CHANNEL_COUNTS,
+    CMS2_CHANNELS_BY_SCHEMA,
     CMS2_INTACT_LAYOUTS,
     CMS2_INTACT_ROW,
     CMS2_LINKER_IDS,
     CMS2_NUM_CHANNELS,
-    CMS2_SCHEMA_VERSION,
     DEFAULT_D_MODEL,
     DEFAULT_DROPOUT,
     DEFAULT_FF_DIM,
@@ -24,7 +24,6 @@ from spectrum_transformer.config import (
     MAIN_TOKEN_IDS,
     MAX_CLEAVAGE_LEN,
     NUM_TOKENS,
-    OUTPUT_CHANNELS,
     SATELLITE_TOKEN_IDS,
 )
 from spectrum_transformer.models.transformer import V20FamilyReadout, V20TransformerStage
@@ -48,15 +47,15 @@ class XLSpectrumTransformer(nn.Module):
         intact_token_ids=None,
     ):
         super().__init__()
-        if (in_channels, out_channels) not in ((CMS2_NUM_CHANNELS, CMS2_NUM_CHANNELS),
-                                               (INPUT_CHANNELS, OUTPUT_CHANNELS)):
-            raise ValueError("XL requires 12 cMS2 channels or 6 legacy XL channels for both input and output.")
-        if in_channels == CMS2_NUM_CHANNELS and aux_dim != AUX_FEATURE_DIM:
+        is_cms2 = in_channels in CMS2_CHANNEL_COUNTS
+        if in_channels != out_channels or (not is_cms2 and in_channels != INPUT_CHANNELS):
+            raise ValueError("XL requires equal input and output widths of 6, 12 or 18 channels.")
+        if is_cms2 and aux_dim != AUX_FEATURE_DIM:
             raise ValueError("cMS2 requires three continuous auxiliary features.")
         if n_layers < 2:
             raise ValueError("XL requires at least one shared layer and one charge layer.")
-        if intact_mode and in_channels != CMS2_NUM_CHANNELS:
-            raise ValueError("The intact row requires a twelve-channel cMS2 model")
+        if intact_mode and not is_cms2:
+            raise ValueError("The intact row requires a cMS2 model")
         self.intact_mode = intact_mode
         if intact_token_ids is None:
             intact_token_ids = MAIN_TOKEN_IDS if intact_mode else ()
@@ -68,7 +67,7 @@ class XLSpectrumTransformer(nn.Module):
 
         self.input_proj = nn.Linear(in_channels, d_model)
         self.aux_proj = nn.Linear(aux_dim, d_model)
-        self.linker_embedding = nn.Embedding(len(CMS2_LINKER_IDS), d_model) if in_channels == CMS2_NUM_CHANNELS else None
+        self.linker_embedding = nn.Embedding(len(CMS2_LINKER_IDS), d_model) if is_cms2 else None
         self.aa_embedding = nn.Embedding(28, sequence_context_dim)
         self.scalar_proj = nn.Linear(11, sequence_context_dim)
         self.context_proj = nn.Linear(2 * sequence_context_dim, d_model)
@@ -115,11 +114,11 @@ class XLSpectrumTransformer(nn.Module):
     @classmethod
     def from_cms2_checkpoint(cls, checkpoint):
         config = checkpoint["model_config"]
+        channels = CMS2_CHANNELS_BY_SCHEMA.get(checkpoint.get("data_schema_version"))
         if (checkpoint.get("model_type") != "xl_spectrum_transformer"
-                or checkpoint.get("data_schema_version") != CMS2_SCHEMA_VERSION
-                or tuple(checkpoint.get("channel_names", ())) != CMS2_CHANNEL_NAMES
+                or channels is None or tuple(checkpoint.get("channel_names", ())) != channels
                 or checkpoint.get("linker_ids") != CMS2_LINKER_IDS
-                or (config["in_channels"], config["out_channels"]) != (CMS2_NUM_CHANNELS, CMS2_NUM_CHANNELS)):
+                or (config["in_channels"], config["out_channels"]) != (len(channels), len(channels))):
             raise ValueError("Incompatible cMS2 checkpoint schema, fragment channels or linker IDs.")
         model = cls(**config)
         if checkpoint.get("intact_layout") != model.intact_layout:

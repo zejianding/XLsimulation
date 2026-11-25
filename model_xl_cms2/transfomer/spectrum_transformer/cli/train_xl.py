@@ -1,4 +1,4 @@
-"""Train the twelve-channel cMS2 Spectrum Transformer or smoke-test one real batch."""
+"""Train the cMS2 Spectrum Transformer or smoke-test one real batch."""
 
 import argparse
 import io
@@ -20,8 +20,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from spectrum_transformer.config import (
-    AUX_FEATURE_DIM, CMS2_CHANNEL_NAMES, CMS2_INTACT_ROW,
-    CMS2_LINKER_IDS, CMS2_NUM_CHANNELS, CMS2_SCHEMA_VERSION,
+    AUX_FEATURE_DIM, CMS2_CHANNELS_BY_SCHEMA, CMS2_INTACT_ROW, CMS2_LINKER_IDS,
     DEFAULT_D_MODEL, DEFAULT_DROPOUT, DEFAULT_EPOCHS, DEFAULT_FF_DIM, DEFAULT_LR,
     DEFAULT_N_HEADS, DEFAULT_N_LAYERS, DEFAULT_SEED, DEFAULT_SEQUENCE_CONTEXT_DIM, DEFAULT_WEIGHT_DECAY,
     MAX_CLEAVAGE_LEN, NUM_TOKENS,
@@ -31,7 +30,7 @@ from spectrum_transformer.models.xl_transformer import XLSpectrumTransformer
 from spectrum_transformer.training.engine import _cosine_per_sample, _masked_mae_per_sample
 from spectrum_transformer.training.logger import TrainingLogger
 from spectrum_transformer.training.xl_engine import (
-    ANCHOR_PROBABILITY_THRESHOLD, FRAGMENT_RECALL_NAMES, compute_xl_batch_loss, evaluate_xl,
+    ANCHOR_PROBABILITY_THRESHOLD, FRAGMENT_RECALL_NAMES_BY_WIDTH, compute_xl_batch_loss, evaluate_xl,
     predict_xl_batch, prepare_xl_batch, xl_density_per_sample,
 )
 from spectrum_transformer.training.xl_losses import (
@@ -47,7 +46,7 @@ DEFAULT_DATASET = Path("D:/XL/prosit-xl/xl_spectrum_training_data/cms2")
 MODEL_CONFIG = {
     "d_model": DEFAULT_D_MODEL, "n_heads": DEFAULT_N_HEADS, "n_layers": DEFAULT_N_LAYERS,
     "ff_dim": DEFAULT_FF_DIM, "dropout": DEFAULT_DROPOUT, "sequence_context_dim": DEFAULT_SEQUENCE_CONTEXT_DIM,
-    "in_channels": CMS2_NUM_CHANNELS, "out_channels": CMS2_NUM_CHANNELS, "aux_dim": AUX_FEATURE_DIM,
+    "aux_dim": AUX_FEATURE_DIM,
 }
 
 
@@ -87,7 +86,9 @@ def _selection_metric(args):
 
 
 def _model_config(dataset):
-    return {**MODEL_CONFIG, "intact_mode": dataset.intact_mode, "intact_token_ids": dataset.intact_token_ids}
+    width = len(CMS2_CHANNELS_BY_SCHEMA[dataset.schema_version])
+    return {**MODEL_CONFIG, "in_channels": width, "out_channels": width,
+            "intact_mode": dataset.intact_mode, "intact_token_ids": dataset.intact_token_ids}
 
 
 def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
@@ -141,7 +142,7 @@ def _checkpoint(model, optimizer, dataset, args, epoch, metrics):
         "selection": selection,
         "data_schema_version": dataset.schema_version,
         "data_metadata": dataset.metadata,
-        "channel_names": CMS2_CHANNEL_NAMES,
+        "channel_names": CMS2_CHANNELS_BY_SCHEMA[dataset.schema_version],
         "linker_ids": CMS2_LINKER_IDS,
         "cleavage_scalar_feature_names": CLEAVAGE_SCALAR_FEATURE_NAMES,
         "chain_order": "bare_sequence,modifications,link_site",
@@ -220,7 +221,8 @@ def _smoke(model, optimizer, dataset, args, device):
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     output, loss, terms = _backward(model, optimizer, batch, args)
-    expected_shape = (len(indices), 2, MAX_CLEAVAGE_LEN + int(model.intact_mode), NUM_TOKENS, CMS2_NUM_CHANNELS)
+    width = len(CMS2_CHANNELS_BY_SCHEMA[dataset.schema_version])
+    expected_shape = (len(indices), 2, MAX_CLEAVAGE_LEN + int(model.intact_mode), NUM_TOKENS, width)
     if batch["target"].shape != expected_shape:
         raise RuntimeError("Invalid cMS2 target shape")
     for key in ("prediction", "backbone_pred", "detail_pred", "detail_logits", "main_anchor_logits", "main_anchor_prob"):
@@ -268,7 +270,7 @@ def _smoke(model, optimizer, dataset, args, device):
         "lengths": raw_batch["lengths"].tolist(), "loss": loss.item(), "loss_terms": terms,
         "gradient_tensors": len(gradients), "peak_cuda_allocated_gib": peak_gib,
         "checkpoint_reload": "passed", "post_step_batch_cosine": metrics["cosine"],
-        "post_step_batch_recall": {name: metrics[name] for name in FRAGMENT_RECALL_NAMES},
+        "post_step_batch_recall": {name: metrics[name] for name in FRAGMENT_RECALL_NAMES_BY_WIDTH[width]},
     }
     if model.intact_mode:
         report["intact_valid_cells"] = int(batch["valid_mask"][:, :, CMS2_INTACT_ROW].sum())
@@ -654,8 +656,8 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     dataset = XLSpectrumDataset(args.dataset_dir, "train", args.intact_labels_dir)
-    if dataset.schema_version != CMS2_SCHEMA_VERSION:
-        raise ValueError("cMS2 training requires a twelve-channel v4 dataset.")
+    if dataset.schema_version not in CMS2_CHANNELS_BY_SCHEMA:
+        raise ValueError("cMS2 training requires a v4 or v5 dataset.")
     if len(dataset) == 0:
         raise ValueError("The XL training split is empty")
     model = XLSpectrumTransformer(**_model_config(dataset)).to(device)

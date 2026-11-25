@@ -6,8 +6,8 @@ import torch
 from tqdm import tqdm
 
 from spectrum_transformer.config import (
-    CMS2_INTACT_CHANNELS, CMS2_INTACT_OFFSET_TOKENS, CMS2_INTACT_ROW, CMS2_NUM_CHANNELS, MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS,
-    SATELLITE_TOKEN_IDS,
+    CMS2_CHANNELS_BY_SCHEMA, CMS2_INTACT_CHANNELS, CMS2_INTACT_OFFSET_TOKENS, CMS2_INTACT_ROW,
+    CMS2_NUM_CHANNELS, MAIN_TOKEN_IDS, RESIDUE_EVENT_TOKEN_IDS, SATELLITE_TOKEN_IDS,
 )
 from spectrum_transformer.training.engine import PEAK_RECALL_BANDS, _cosine_per_sample, _masked_mae_per_sample
 from spectrum_transformer.training.xl_losses import SHORT_CHAIN_MAX_LENGTH, xl_compound_loss
@@ -27,6 +27,10 @@ _DENSITY_THRESHOLD = 0.03
 _PRESENCE_PREDICTION_THRESHOLD = 0.05
 FRAGMENT_RECALL_NAMES = ("plain_recall", "short_recall", "long_recall",
                          "fragment_z1_recall", "fragment_z2_recall", "fragment_z3_recall")
+FRAGMENT_RECALL_NAMES_BY_WIDTH = {
+    CMS2_NUM_CHANNELS: FRAGMENT_RECALL_NAMES,
+    len(CMS2_CHANNELS_BY_SCHEMA[5]): (*FRAGMENT_RECALL_NAMES[:3], "sulfenic_recall", *FRAGMENT_RECALL_NAMES[3:]),
+}
 
 
 def prepare_xl_batch(batch, device):
@@ -74,14 +78,15 @@ def _fragment_peak_counts(peaks, link_sites):
     b_contains_site = cuts >= link_sites.unsqueeze(-1)
     b = by_channel[..., :3].sum(-1)
     y = by_channel[..., 3:6].sum(-1)
-    states = torch.stack((
+    plain_and_short = torch.stack((
         torch.where(b_contains_site, y, b).sum((1, 2)),
         torch.where(b_contains_site, b, y).sum((1, 2)),
-        by_channel[..., 6:].sum((1, 2, 3)),
     ), dim=1)
-    # Both arms have B1+, B2+, B3+, Y1+, Y2+, Y3+ in that order.
-    charges = by_channel.sum((1, 2)).reshape(peaks.size(0), 4, 3).sum(1)
-    return torch.cat((states, charges), dim=1)
+    # Every six-channel block has B1+, B2+, B3+, Y1+, Y2+, Y3+ in that order.
+    totals = by_channel.sum((1, 2))
+    by_stub = totals.reshape(peaks.size(0), -1, 6).sum(-1)
+    charges = totals.reshape(peaks.size(0), -1, 3).sum(1)
+    return torch.cat((plain_and_short, by_stub[:, 1:], charges), dim=1)
 
 
 def _intensity_diagnostics(prediction, target, valid, link_sites):
@@ -116,7 +121,7 @@ def _intensity_diagnostics(prediction, target, valid, link_sites):
         band_hits = (band & predicted_peaks).flatten(1).sum(1)
         band_counts.append(torch.stack((band_hits, band.flatten(1).sum(1)), dim=1))
     counts = torch.stack(band_counts, dim=1)
-    if prediction.size(-1) == CMS2_NUM_CHANNELS:
+    if prediction.size(-1) in FRAGMENT_RECALL_NAMES_BY_WIDTH:
         fragment_counts = torch.stack((
             _fragment_peak_counts(predicted_peaks & target_peaks, link_sites),
             _fragment_peak_counts(target_peaks, link_sites),
@@ -254,6 +259,8 @@ def evaluate_xl(model, loader, device, desc=None, *, peak_presence=False):
     charge_values = charges.unique().tolist()
     rows = torch.cat(metric_batches)
     recall_counts = torch.cat(recall_batches)
+    recall_names = (tuple(name for name, _, _ in PEAK_RECALL_BANDS)
+                    + FRAGMENT_RECALL_NAMES_BY_WIDTH.get(batch["target"].size(-1), ()))
     if intact_mae_batches:
         intact_mae = torch.cat(intact_mae_batches)
         intact_counts = torch.cat(intact_count_batches)
@@ -264,7 +271,6 @@ def evaluate_xl(model, loader, device, desc=None, *, peak_presence=False):
         del averages["zero_positive"]
         averages["samples"] = len(group)
         averages["zero_positive_samples"] = int(group[:, names.index("zero_positive")].sum())
-        recall_names = tuple(name for name, _, _ in PEAK_RECALL_BANDS) + FRAGMENT_RECALL_NAMES
         for name, (hits, peaks) in zip(recall_names, counts.sum(dim=0).tolist()):
             averages[name] = hits / peaks if peaks else None
         if intact_mae_batches:

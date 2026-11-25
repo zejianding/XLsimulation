@@ -37,6 +37,11 @@ OUTPUT_CHANNELS = 6
 CMS2_SCHEMA_VERSION = 4
 CMS2_CHANNEL_NAMES = tuple(f"{state}_{ion}" for state in ("plain_or_short", "long") for ion in CHANNEL_NAMES)
 CMS2_NUM_CHANNELS = len(CMS2_CHANNEL_NAMES)
+CMS2_CHANNELS_BY_SCHEMA = {
+    CMS2_SCHEMA_VERSION: CMS2_CHANNEL_NAMES,
+    5: CMS2_CHANNEL_NAMES + tuple(f"sulfenic_{ion}" for ion in CHANNEL_NAMES),
+}
+CMS2_CHANNEL_COUNTS = tuple(len(names) for names in CMS2_CHANNELS_BY_SCHEMA.values())
 CMS2_FRAGMENT_CHARGES = (1, 2, 3, 1, 2, 3) * 2
 CMS2_LINKER_IDS = {"DSSO": 0, "DSBU": 1}
 # The optional last row represents the intact chain at the offsets enabled by its labels.

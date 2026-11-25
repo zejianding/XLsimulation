@@ -11,10 +11,9 @@ import torch
 from torch.utils.data import Dataset
 
 from ..config import (
-    CHANNEL_NAMES, CMS2_CHANNEL_NAMES, CMS2_FRAGMENT_CHARGES, CMS2_INTACT_CHANNELS, CMS2_INTACT_OFFSET_TOKENS,
-    CMS2_INTACT_ROW,
-    CMS2_LINKER_IDS, CMS2_NUM_CHANNELS,
-    CMS2_SCHEMA_VERSION, DEFAULT_MIN_VALID_MZ, MAIN_TOKEN_IDS, MAX_CLEAVAGE_LEN, MAX_PEPTIDE_LEN, NUM_TOKENS,
+    CHANNEL_NAMES, CMS2_CHANNELS_BY_SCHEMA, CMS2_FRAGMENT_CHARGES, CMS2_INTACT_CHANNELS, CMS2_INTACT_OFFSET_TOKENS,
+    CMS2_INTACT_ROW, CMS2_LINKER_IDS, DEFAULT_MIN_VALID_MZ, MAIN_TOKEN_IDS, MAX_CLEAVAGE_LEN, MAX_PEPTIDE_LEN,
+    NUM_TOKENS,
 )
 from ..training.target_processing import build_main_peak_mask
 from .dataset import (
@@ -44,8 +43,6 @@ MAIN_ANCHOR_THRESHOLD = 0.03
 
 _MAIN_TOKEN = MAIN_TOKEN_IDS[0]
 _BASE_SHAPE = (2, MAX_CLEAVAGE_LEN, len(CHANNEL_NAMES))
-_GRID_SHAPE = (2, MAX_CLEAVAGE_LEN, NUM_TOKENS, len(CHANNEL_NAMES))
-_CMS2_GRID_SHAPE = (2, MAX_CLEAVAGE_LEN, NUM_TOKENS, CMS2_NUM_CHANNELS)
 _CHANNEL_CHARGES = np.array(CMS2_FRAGMENT_CHARGES[:len(CHANNEL_NAMES)])
 _TOKEN_OFFSETS = np.column_stack([CHARGE_TOKENS[charge] for charge in _CHANNEL_CHARGES])
 _CLEAVAGES = np.arange(1, MAX_CLEAVAGE_LEN + 1)
@@ -159,19 +156,20 @@ class XLInputCollator:
     """Prepare model inputs and retain the original XL m/z grid for export."""
 
     def __init__(self, metadata, schema_version):
-        if type(schema_version) is not int or schema_version not in (1, 2, CMS2_SCHEMA_VERSION):
-            raise ValueError(f"Unsupported XL input schema version {schema_version!r}; expected 1, 2 or 4")
+        if type(schema_version) is not int or schema_version not in (1, 2, *CMS2_CHANNELS_BY_SCHEMA):
+            raise ValueError(f"Unsupported XL input schema version {schema_version!r}; expected 1, 2, 4 or 5")
         if metadata["train_statistics"].get("aux_order") != list(AUX_FEATURE_NAMES):
             raise ValueError("Unexpected XL auxiliary feature order in train_statistics")
         self.schema_version = schema_version
-        self.is_cms2 = schema_version == CMS2_SCHEMA_VERSION
+        self.is_cms2 = schema_version in CMS2_CHANNELS_BY_SCHEMA
+        channel_names = CMS2_CHANNELS_BY_SCHEMA.get(schema_version, CHANNEL_NAMES)
         if self.is_cms2 and (
-            metadata.get("channel_names") != list(CMS2_CHANNEL_NAMES)
+            metadata.get("channel_names") != list(channel_names)
             or metadata.get("sequence_constrained") != "full_same_state"
         ):
-            raise ValueError("Expected cMS2 v4 channel order and full_same_state targets")
-        channels = CMS2_NUM_CHANNELS if self.is_cms2 else len(CHANNEL_NAMES)
-        self._mz_mean, self._mz_std = _normalization_stats(metadata, "mz_channels", channels)
+            raise ValueError(f"Expected cMS2 v{schema_version} channel order and full_same_state targets")
+        self.grid_shape = (2, MAX_CLEAVAGE_LEN, NUM_TOKENS, len(channel_names))
+        self._mz_mean, self._mz_std = _normalization_stats(metadata, "mz_channels", len(channel_names))
         self._aux_mean, self._aux_std = _normalization_stats(metadata, "aux_features", len(AUX_FEATURE_NAMES))
 
     def __call__(self, records, intact_labels=None):
@@ -182,8 +180,8 @@ class XLInputCollator:
         charges = aux_raw[:, 0].astype(np.int64)
         mz = np.stack([row["input_theo_mz"] for row in records])
         if self.is_cms2:
-            if mz.shape[1:] != _CMS2_GRID_SHAPE:
-                raise ValueError(f"Expected expanded cMS2 m/z grids of shape {_CMS2_GRID_SHAPE}")
+            if mz.shape[1:] != self.grid_shape:
+                raise ValueError(f"Expected expanded cMS2 m/z grids of shape {self.grid_shape}")
             valid = np.isfinite(mz) & (mz >= DEFAULT_MIN_VALID_MZ)
             if intact_labels is not None:
                 mz = _append_intact_row(mz, intact_labels["mz"])
@@ -250,7 +248,7 @@ class XLSpectrumDataset(Dataset):
         self.schema_version = self.metadata.get("schema_version", 1)
         self._input_collator = XLInputCollator(self.metadata, self.schema_version)
         is_cms2 = self._input_collator.is_cms2
-        grid_shape = _CMS2_GRID_SHAPE if is_cms2 else _GRID_SHAPE
+        grid_shape = self._input_collator.grid_shape
         input_shape = _BASE_SHAPE if self.schema_version == 1 else grid_shape
         dtype = _record_dtype(self.metadata["string_widths"], input_shape, grid_shape)
         expected = {
@@ -290,7 +288,7 @@ class XLSpectrumDataset(Dataset):
         self.intact_token_ids = ()
         if self.intact_mode:
             if not is_cms2:
-                raise ValueError("Intact labels require a cMS2 v4 dataset")
+                raise ValueError("Intact labels require a cMS2 dataset")
             self._intact_labels, self.intact_token_ids = _load_intact_labels(intact_labels_dir, split, records)
             self._intact_indices = {gid: i for i, gid in enumerate(self._intact_labels["group_id"])}
 

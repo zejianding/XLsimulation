@@ -12,7 +12,8 @@ import torch
 
 from spectrum_transformer.cli import train_xl
 from spectrum_transformer.config import (
-    CMS2_CHANNEL_NAMES, CMS2_INTACT_CHANNELS, CMS2_INTACT_ROW, CMS2_SCHEMA_VERSION, MAIN_TOKEN_IDS, SATELLITE_TOKEN_IDS,
+    CMS2_CHANNELS_BY_SCHEMA, CMS2_INTACT_CHANNELS, CMS2_INTACT_ROW, CMS2_SCHEMA_VERSION, MAIN_TOKEN_IDS,
+    SATELLITE_TOKEN_IDS,
 )
 from spectrum_transformer.data.xl_dataset import AUX_FEATURE_NAMES, XLSpectrumDataset, _record_dtype
 from spectrum_transformer.models.xl_transformer import XLSpectrumTransformer
@@ -29,8 +30,13 @@ class EchoPrediction(torch.nn.Module):
 
 class IntactCheckpointTests(unittest.TestCase):
     def test_five_offset_order_survives_checkpoint_round_trip(self):
+        for schema_version in CMS2_CHANNELS_BY_SCHEMA:
+            with self.subTest(schema_version=schema_version):
+                self.check_round_trip(schema_version)
+
+    def check_round_trip(self, schema_version):
         tokens = (24, 25, 26, 22, 23)
-        dataset = SimpleNamespace(intact_mode=True, intact_token_ids=tokens, schema_version=CMS2_SCHEMA_VERSION,
+        dataset = SimpleNamespace(intact_mode=True, intact_token_ids=tokens, schema_version=schema_version,
                                   metadata={})
         args = SimpleNamespace(empty_peak_weight=0., peak_ranking_weight=0., seed=42, batch_size=1,
                                num_workers=0, epochs=0, lr=0.001, weight_decay=0.)
@@ -44,6 +50,15 @@ class IntactCheckpointTests(unittest.TestCase):
             saved = torch.load(path, map_location="cpu", weights_only=True)
         self.assertEqual(saved["intact_layout"]["offset_token_ids"], tokens)
         restored = XLSpectrumTransformer.from_cms2_checkpoint(saved)
+        channels = CMS2_CHANNELS_BY_SCHEMA[schema_version]
+        self.assertEqual(saved["channel_names"], channels)
+        self.assertEqual(restored.input_proj.in_features, len(channels))
+        self.assertEqual(restored.backbone_head.main_head[-1].out_features, len(channels))
+        self.assertEqual(restored.main_anchor_head[-1].out_features, len(channels))
+        with self.assertRaisesRegex(ValueError, "fragment channels"):
+            XLSpectrumTransformer.from_cms2_checkpoint({**saved, "channel_names": channels[::-1]})
+        with self.assertRaisesRegex(ValueError, "schema"):
+            XLSpectrumTransformer.from_cms2_checkpoint({**saved, "data_schema_version": 5 if schema_version == 4 else 4})
         self.assertEqual(restored.intact_token_ids, tokens)
         self.assertEqual(restored.intact_layout["offset_names"], ("0", "M+1", "M+2", "-H2O", "-NH3"))
         saved["intact_layout"]["offset_token_ids"] = tuple(sorted(tokens))
@@ -177,8 +192,14 @@ class CMS2Tests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        path = Path(directory.name)
-        grid = (2, 39, 46, 12)
+        self.main = MAIN_TOKEN_IDS[0]
+        self.dataset = self.make_dataset(Path(directory.name), CMS2_SCHEMA_VERSION)
+        self.addCleanup(lambda: setattr(self, "dataset", None))  # close the mmap before Windows removes the file
+
+    def make_dataset(self, path, schema_version):
+        channels = CMS2_CHANNELS_BY_SCHEMA[schema_version]
+        width = len(channels)
+        grid = (2, 39, 46, width)
         widths = {"sequence_bytes": 4, "crosslinker_bytes": 4}
         dtype = _record_dtype(widths, grid, grid)
         records = np.zeros(2, dtype=dtype)
@@ -188,7 +209,6 @@ class CMS2Tests(unittest.TestCase):
         records["link_sites"] = [2, 4]
         records["crosslinker"] = [b"DSSO", b"DSBU"]
         records["precursor_charge"] = [4, 7]
-        self.main = MAIN_TOKEN_IDS[0]
         # Chain A cuts 1 and 2 straddle K2. Chain B links at its terminal K4.
         for chain, cut, channel, target in (
             (0, 1, 0, .4), (0, 2, 0, .8), (0, 2, 6, .7),
@@ -199,20 +219,62 @@ class CMS2Tests(unittest.TestCase):
             records["target"][cell] = target
         records[1]["input_theo_mz"][0, 0, self.main, 0] = 120.
         records[1]["target"][0, 0, self.main, 0] = .5
+        if schema_version == 5:
+            for cut, token, channel in ((1, self.main, 12), (0, 25, 16), (1, 27, 14)):
+                cell = (0, 0, cut, token, channel)
+                records["input_theo_mz"][cell] = 200.
+                records["target"][cell] = .7
         np.save(path / "train.npy", records)
         metadata = {
-            "schema_version": 4, "spectrum_type": "cms2", "average_across_nce": True,
+            "schema_version": schema_version, "spectrum_type": "cms2", "average_across_nce": True,
             "input_representation": "expanded_raw_mz", "input_dtype": "float64",
             "grid_shape": grid, "input_shape": grid, "main_token_id": self.main,
             "string_widths": widths, "fields": dtype.names, "record_bytes": dtype.itemsize,
-            "channel_names": CMS2_CHANNEL_NAMES, "min_valid_mz": 100, "sequence_constrained": "full_same_state",
+            "channel_names": channels, "min_valid_mz": 100, "sequence_constrained": "full_same_state",
             "clip_intensity": 50000, "target_normalization": "sqrt_clip", "splits": {"train": {"written_groups": 2}},
             "train_statistics": {"aux_order": AUX_FEATURE_NAMES, "aux_features": {"mean": [0]*3, "std": [1]*3},
-                                 "mz_channels": {"mean": list(range(100, 112)), "std": [2]*12}},
+                                 "mz_channels": {"mean": list(range(100, 100 + width)), "std": [2]*width}},
         }
         (path / "meta.json").write_text(json.dumps(metadata), encoding="utf-8")
-        self.dataset = XLSpectrumDataset(path, "train")
-        self.addCleanup(lambda: setattr(self, "dataset", None))  # close the mmap before Windows removes the file
+        return XLSpectrumDataset(path, "train")
+
+    def test_sulfenic_channels_mask_loss_and_fragment_recall(self):
+        path = self.dataset.dataset_dir / "sul"
+        path.mkdir()
+        sul = self.make_dataset(path, 5)
+        directory, _ = self.intact_labels()
+        ds = XLSpectrumDataset(path, "train", directory)
+        batch = ds.collate_fn([ds[0], ds[1]])
+        row = CMS2_INTACT_ROW
+        self.assertEqual(batch["target"].shape, (2, 2, 40, 46, 18))
+        old = self.dataset.collate_fn([self.dataset[0], self.dataset[1]])
+        for field in ("input", "target", "valid_mask", "main_anchor_target"):
+            torch.testing.assert_close(batch[field][:, :, :row, :, :12], old[field])
+        mask = batch["valid_mask"]
+        self.assertEqual(mask[0, :, :row, :, 12:].sum().item(), 3)
+        self.assertFalse(mask[1, ..., 12:].any())  # DSBU
+        self.assertFalse(mask[:, :, row, :, 12:].any())
+        self.assertEqual(batch["input"][0, 0, 1, self.main, 12].item(), (200 - 112) / 2)
+
+        prediction = torch.full_like(batch["target"], .2, requires_grad=True)
+        loss, _ = xl_compound_loss(prediction, batch["target"], mask, charges=batch["precursor_charge"],
+                                   lengths=batch["lengths"], main_anchor_prob=torch.full_like(prediction, .5))
+        loss.backward()
+        sul_gradient = prediction.grad[..., 12:]
+        self.assertEqual(sul_gradient[mask[..., 12:]].count_nonzero().item(), 3)
+        self.assertFalse(sul_gradient[~mask[..., 12:]].any())
+
+        batch["input"] = batch["target"].clone()
+        batch["input"][..., 16] = 0  # miss only y-sulfenic 2+
+        report = evaluate_xl(EchoPrediction(), [batch], torch.device("cpu"))
+        self.assertEqual(report["sulfenic_recall"], 2/3)
+        self.assertEqual(report["long_recall"], 1.)
+        self.assertEqual(report["fragment_z2_recall"], 1/2)
+        self.assertIsNone(report["by_charge"]["7"]["sulfenic_recall"])
+        meta = {**sul.metadata, "channel_names": sul.metadata["channel_names"][::-1]}
+        (path / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "channel order"):
+            XLSpectrumDataset(path, "train")
 
     def intact_labels(self):
         directory = self.dataset.dataset_dir / "intact"
